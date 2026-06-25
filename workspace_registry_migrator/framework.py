@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -62,6 +63,46 @@ def _retry_on_rate_limit(
         return wrapper
 
     return decorator
+
+
+# Module-level lock to prevent concurrent env var pollution between
+# source reads and target writes in multi-threaded execution.
+_mlflow_env_lock = threading.Lock()
+
+
+class ThreadSafeMlflowTarget:
+    """Proxy around MlflowClient that ensures target env before every call."""
+
+    def __init__(self, client: MlflowClient, target_host: str, target_token: str | None) -> None:
+        self._client = client
+        self._target_host = target_host
+        self._target_token = target_token
+
+    def _ensure_target_env(self) -> None:
+        import os
+        os.environ.pop("DATABRICKS_HOST", None)
+        os.environ.pop("DATABRICKS_TOKEN", None)
+        os.environ.pop("DATABRICKS_CLIENT_ID", None)
+        os.environ.pop("DATABRICKS_CLIENT_SECRET", None)
+        if self._target_host:
+            os.environ["DATABRICKS_HOST"] = self._target_host
+        if self._target_token:
+            os.environ["DATABRICKS_TOKEN"] = self._target_token
+        mlflow.set_tracking_uri("databricks")
+        mlflow.set_registry_uri("databricks")
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        @functools.wraps(attr)
+        def locked_call(*args, **kwargs):
+            with _mlflow_env_lock:
+                self._ensure_target_env()
+                return attr(*args, **kwargs)
+
+        return locked_call
 
 
 @dataclass(frozen=True)
@@ -205,11 +246,12 @@ class SourceWorkspaceContext:
         mlflow.set_registry_uri(previous.get("MLFLOW_REGISTRY_URI") or "databricks")
 
     def with_client(self, callback):
-        previous = self._apply_env()
-        try:
-            return callback(self._client())
-        finally:
-            self._restore_env(previous)
+        with _mlflow_env_lock:
+            previous = self._apply_env()
+            try:
+                return callback(self._client())
+            finally:
+                self._restore_env(previous)
 
     def search_registered_models(self) -> list[RegisteredModel]:
         def _load(client: MlflowClient) -> list[RegisteredModel]:
@@ -290,9 +332,12 @@ class WorkspaceRegistryMigrator:
         self.logger = logger or NotebookLogger()
         self.source = SourceWorkspaceContext(source_credentials)
         self.target_workspace = WorkspaceClient()
+        self._target_host = self.target_workspace.config.host
+        self._target_token = self.target_workspace.config.token
         mlflow.set_tracking_uri("databricks")
         mlflow.set_registry_uri("databricks")
-        self.target = MlflowClient(tracking_uri="databricks", registry_uri="databricks")
+        _raw_target = MlflowClient(tracking_uri="databricks", registry_uri="databricks")
+        self.target = ThreadSafeMlflowTarget(_raw_target, self._target_host, self._target_token)
 
     def _configure_runtime_noise(self) -> None:
         logging.getLogger("mlflow").setLevel(logging.ERROR)
@@ -342,9 +387,9 @@ class WorkspaceRegistryMigrator:
     def _list_registered_models(self) -> list[RegisteredModel]:
         models = self.source.search_registered_models()
         filtered = [model for model in models if "." not in model.name]
-        requested = set(self.options.extra_model_names)
+        requested = {name.strip() for name in self.options.extra_model_names}
         if requested:
-            filtered = [model for model in filtered if model.name in requested]
+            filtered = [model for model in filtered if model.name.strip() in requested]
         for model in filtered:
             self.logger.info(f"Discovered model {model.name}")
         return filtered
@@ -527,9 +572,12 @@ class WorkspaceRegistryMigrator:
             target_run_id=target_run_id,
             artifact_path=artifact_path,
         )
+        # Workspace registry requires full dbfs:/ path for model source
+        target_run_info = self.target.get_run(target_run_id)
+        model_source = f"{target_run_info.info.artifact_uri}/{artifact_path}"
         created_version = self.target.create_model_version(
             name=target_model_name,
-            source=artifact_path,
+            source=model_source,
             run_id=target_run_id,
             description=version.description,
             tags={
@@ -635,16 +683,51 @@ class WorkspaceRegistryMigrator:
     def _copy_run_artifacts(self, source_run_id: str, target_run_id: str) -> None:
         if not self.options.download_artifacts:
             return
-        with temporary_directory(
-            prefix=f"artifacts_{sanitize_name(source_run_id)}_",
-            parent_dir=self.options.artifact_temp_dir,
-        ) as temp_dir:
-            downloaded_path = Path(self.source.download_artifacts(run_id=source_run_id, dst_path=temp_dir))
-            if downloaded_path.is_file():
-                self.target.log_artifact(run_id=target_run_id, local_path=str(downloaded_path), artifact_path=None)
-                return
-            root = downloaded_path if downloaded_path.is_dir() else Path(temp_dir)
-            self.target.log_artifacts(run_id=target_run_id, local_dir=str(root), artifact_path=None)
+        # List top-level artifacts first; skip runs with empty/corrupt artifact paths
+        try:
+            top_level = self.source.with_client(
+                lambda client: client.list_artifacts(run_id=source_run_id)
+            )
+        except Exception as exc:
+            self.logger.warning(f"Cannot list artifacts for run {source_run_id}: {exc}")
+            return
+        if not top_level:
+            return
+        # Download each top-level artifact individually to isolate failures
+        for artifact in top_level:
+            artifact_path = artifact.path
+            if not artifact_path or not artifact_path.strip():
+                self.logger.warning(f"Skipping artifact with empty path in run {source_run_id}")
+                continue
+            try:
+                with temporary_directory(
+                    prefix=f"artifacts_{sanitize_name(source_run_id)}_",
+                    parent_dir=self.options.artifact_temp_dir,
+                ) as temp_dir:
+                    downloaded_path = Path(
+                        self.source.download_artifacts(
+                            run_id=source_run_id,
+                            dst_path=temp_dir,
+                            artifact_path=artifact_path,
+                        )
+                    )
+                    if downloaded_path.is_file():
+                        parent = str(Path(artifact_path).parent)
+                        self.target.log_artifact(
+                            run_id=target_run_id,
+                            local_path=str(downloaded_path),
+                            artifact_path=None if parent == "." else parent,
+                        )
+                    elif downloaded_path.is_dir():
+                        self.target.log_artifacts(
+                            run_id=target_run_id,
+                            local_dir=str(downloaded_path),
+                            artifact_path=artifact_path,
+                        )
+            except Exception as exc:
+                self.logger.warning(
+                    f"Skipping artifact '{artifact_path}' in run {source_run_id}: {exc}"
+                )
 
     def _source_model_artifact_path(self, version: ModelVersion) -> str:
         source = getattr(version, "source", None) or ""
