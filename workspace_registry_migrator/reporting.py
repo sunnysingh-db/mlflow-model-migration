@@ -18,7 +18,7 @@ def _get_client() -> MlflowClient:
     return MlflowClient(tracking_uri="databricks", registry_uri="databricks")
 
 
-def _parse_model_metadata(run_id: str) -> dict[str, str | None]:
+def _parse_model_metadata(run_id: str, tracking_uri: str = "databricks") -> dict[str, str | None]:
     """Extract flavor and requirements from a run's model artifacts."""
     result: dict[str, str | None] = {"flavors": None, "requirements": None, "python_version": None}
     if not run_id:
@@ -27,7 +27,7 @@ def _parse_model_metadata(run_id: str) -> dict[str, str | None]:
         try:
             path = mlflow.artifacts.download_artifacts(
                 run_id=run_id, artifact_path="model/MLmodel",
-                dst_path=tmp, tracking_uri="databricks",
+                dst_path=tmp, tracking_uri=tracking_uri,
             )
             with open(path) as f:
                 mlmodel = yaml.safe_load(f)
@@ -39,7 +39,7 @@ def _parse_model_metadata(run_id: str) -> dict[str, str | None]:
         try:
             path = mlflow.artifacts.download_artifacts(
                 run_id=run_id, artifact_path="model/requirements.txt",
-                dst_path=tmp, tracking_uri="databricks",
+                dst_path=tmp, tracking_uri=tracking_uri,
             )
             with open(path) as f:
                 deps = [line.strip() for line in f if line.strip() and not line.startswith("#")]
@@ -53,124 +53,236 @@ def generate_inventory_report(
     inventory: DiscoveryBundle,
     source_host: str = "",
     target_host: str = "",
+    source_context=None,
+    include_metadata: bool = True,
+    max_workers: int = 20,
 ) -> pd.DataFrame:
     """Generate a model-level pre-migration inventory DataFrame.
 
     One row per registered model with aggregated metadata.
     Includes source_host and target_host for multi-workspace tracking.
+
+    Args:
+        source_context: SourceWorkspaceContext pointing to the SOURCE workspace.
+                        If None, falls back to local _get_client() (same-workspace mode).
+        include_metadata: If True, downloads MLmodel + requirements.txt per version
+                          to extract flavors/requirements. Set False for fast discovery
+                          (~10x faster for large registries, skips artifact downloads).
+        max_workers: Max parallel threads for processing models concurrently.
     """
-    client = _get_client()
-    exp_lookup = {e.experiment_id: e for e in inventory.experiments}
-    runs_count_by_exp = {eid: len(runs) for eid, runs in inventory.runs_by_experiment_id.items()}
+    # Apply source environment so all MLflow calls target the correct workspace
+    _prev_env = None
+    if source_context:
+        _prev_env = source_context._apply_env()
+        client = source_context._client()
+        source_tracking_uri = source_context.credentials.resolved_tracking_uri()
+    else:
+        client = _get_client()
+        source_tracking_uri = "databricks"
+    try:
+        return _generate_inventory_rows(
+            inventory, source_host, target_host, client,
+            source_tracking_uri, include_metadata, max_workers,
+        )
+    finally:
+        if source_context and _prev_env is not None:
+            source_context._restore_env(_prev_env)
 
-    rows: list[dict[str, Any]] = []
-    for model in inventory.registered_models:
-        accessible_versions = inventory.model_versions_by_name.get(model.name, [])
-        all_versions = list(client.search_model_versions(
-            filter_string=f"name='{model.name.replace(chr(39), chr(39) + chr(39))}'"
-        ))
 
-        users: set[str] = set()
-        experiments: set[str] = set()
-        experiment_names: set[str] = set()
-        stages: set[str] = set()
-        versions_ready = 0
-        versions_blocked = 0
-        flavors_seen: set[str] = set()
-        python_versions_seen: set[str] = set()
-        latest_created: datetime | None = None
-        representative_meta: dict[str, str | None] = {"flavors": None, "requirements": None, "python_version": None}
-        discovery_comments_parts: list[str] = []
-        total_params = 0
-        total_metrics = 0
-        total_artifacts = 0
+def _process_single_model(
+    model,
+    inventory: DiscoveryBundle,
+    source_host: str,
+    target_host: str,
+    client: MlflowClient,
+    source_tracking_uri: str,
+    include_metadata: bool,
+    exp_lookup: dict,
+    runs_count_by_exp: dict,
+) -> dict[str, Any]:
+    """Process a single model and return its inventory row dict."""
+    all_versions = list(client.search_model_versions(
+        filter_string=f"name='{model.name.replace(chr(39), chr(39) + chr(39))}'"
+    ))
 
-        for v in all_versions:
-            if v.creation_timestamp:
-                ts = datetime.fromtimestamp(v.creation_timestamp / 1000)
-                if latest_created is None or ts > latest_created:
-                    latest_created = ts
-            if v.current_stage and v.current_stage != "None":
-                stages.add(v.current_stage)
-            if v.user_id:
-                users.add(v.user_id)
+    users: set[str] = set()
+    experiments: set[str] = set()
+    experiment_names: set[str] = set()
+    stages: set[str] = set()
+    versions_ready = 0
+    versions_blocked = 0
+    flavors_seen: set[str] = set()
+    python_versions_seen: set[str] = set()
+    latest_created: datetime | None = None
+    representative_meta: dict[str, str | None] = {"flavors": None, "requirements": None, "python_version": None}
+    discovery_comments_parts: list[str] = []
+    total_params = 0
+    total_metrics = 0
+    total_artifacts = 0
 
-            try:
-                run = client.get_run(v.run_id)
-                user_email = run.data.tags.get("mlflow.user", v.user_id or "")
-                if user_email:
-                    users.add(user_email)
-                exp_id = run.info.experiment_id
-                experiments.add(exp_id)
-                exp = exp_lookup.get(exp_id)
-                if exp:
-                    experiment_names.add(exp.name)
-                else:
-                    try:
-                        experiment_names.add(client.get_experiment(exp_id).name)
-                    except Exception:
-                        experiment_names.add(f"(id: {exp_id})")
-                versions_ready += 1
-                total_params += len(run.data.params)
-                total_metrics += len(run.data.metrics)
+    for v in all_versions:
+        if v.creation_timestamp:
+            ts = datetime.fromtimestamp(v.creation_timestamp / 1000)
+            if latest_created is None or ts > latest_created:
+                latest_created = ts
+        if v.current_stage and v.current_stage != "None":
+            stages.add(v.current_stage)
+        if v.user_id:
+            users.add(v.user_id)
+
+        try:
+            run = client.get_run(v.run_id)
+            user_email = run.data.tags.get("mlflow.user", v.user_id or "")
+            if user_email:
+                users.add(user_email)
+            exp_id = run.info.experiment_id
+            experiments.add(exp_id)
+            exp = exp_lookup.get(exp_id)
+            if exp:
+                experiment_names.add(exp.name)
+            else:
                 try:
-                    total_artifacts += len(client.list_artifacts(run_id=v.run_id, path="model"))
+                    experiment_names.add(client.get_experiment(exp_id).name)
                 except Exception:
-                    pass
+                    experiment_names.add(f"(id: {exp_id})")
+            versions_ready += 1
+            total_params += len(run.data.params)
+            total_metrics += len(run.data.metrics)
+            try:
+                total_artifacts += len(client.list_artifacts(run_id=v.run_id, path="model"))
+            except Exception:
+                pass
 
-                meta = _parse_model_metadata(v.run_id)
+            if include_metadata:
+                meta = _parse_model_metadata(v.run_id, tracking_uri=source_tracking_uri)
                 if meta["flavors"]:
                     flavors_seen.add(meta["flavors"])
                     representative_meta = meta
                 if meta["python_version"]:
                     python_versions_seen.add(meta["python_version"])
+        except Exception as exc:
+            versions_blocked += 1
+            discovery_comments_parts.append(f"v{v.version}: {str(exc)[:80]}")
+
+    total_runs = sum(runs_count_by_exp.get(eid, 0) for eid in experiments)
+
+    if versions_ready == 0:
+        readiness = "\u274c BLOCKED \u2014 all runs deleted"
+    elif versions_blocked > 0:
+        readiness = f"\u26a0\ufe0f PARTIAL \u2014 {versions_ready}/{len(all_versions)} versions migratable"
+    else:
+        readiness = "\u2705 READY"
+
+    return {
+        "source_host": source_host,
+        "target_host": target_host,
+        "model_name": model.name,
+        "readiness": readiness,
+        "source_versions": len(all_versions),
+        "source_versions_migratable": versions_ready,
+        "source_versions_blocked": versions_blocked,
+        "source_experiments": len(experiments),
+        "source_runs": total_runs,
+        "source_params": total_params,
+        "source_metrics": total_metrics,
+        "source_artifacts": total_artifacts,
+        "stages": ", ".join(sorted(stages)) or "None",
+        "owner_emails": ", ".join(sorted(users)),
+        "flavors": " | ".join(sorted(flavors_seen)) if flavors_seen else None,
+        "requirements": representative_meta["requirements"],
+        "python_version": ", ".join(sorted(python_versions_seen)) if python_versions_seen else None,
+        "experiments": " | ".join(sorted(experiment_names)),
+        "latest_version_created": latest_created.strftime("%Y-%m-%d %H:%M") if latest_created else "",
+        "created": datetime.fromtimestamp(model.creation_timestamp / 1000).strftime("%Y-%m-%d") if model.creation_timestamp else "",
+        # Target columns — populated during migration
+        "target_versions": 0,
+        "target_runs": 0,
+        "target_params": 0,
+        "target_metrics": 0,
+        "target_artifacts": 0,
+        "migration_status": "PENDING",
+        "discovery_comments": "; ".join(discovery_comments_parts) if discovery_comments_parts else None,
+        "migration_comments": None,
+        "target_model_url": None,
+        "target_experiment_urls": None,
+        "last_updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _generate_inventory_rows(
+    inventory: DiscoveryBundle,
+    source_host: str,
+    target_host: str,
+    client: MlflowClient,
+    source_tracking_uri: str,
+    include_metadata: bool = True,
+    max_workers: int = 20,
+) -> pd.DataFrame:
+    """Build inventory DataFrame with parallel per-model processing."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    exp_lookup = {e.experiment_id: e for e in inventory.experiments}
+    runs_count_by_exp = {eid: len(runs) for eid, runs in inventory.runs_by_experiment_id.items()}
+    models = inventory.registered_models
+
+    if not models:
+        return pd.DataFrame([])
+
+    rows: list[dict[str, Any]] = []
+    num_workers = min(max_workers, len(models))
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        future_map = {
+            pool.submit(
+                _process_single_model,
+                model, inventory, source_host, target_host, client,
+                source_tracking_uri, include_metadata, exp_lookup, runs_count_by_exp,
+            ): model.name
+            for model in models
+        }
+        completed = 0
+        for future in as_completed(future_map):
+            model_name = future_map[future]
+            try:
+                row = future.result()
+                rows.append(row)
             except Exception as exc:
-                versions_blocked += 1
-                discovery_comments_parts.append(f"v{v.version}: {str(exc)[:80]}")
-
-        total_runs = sum(runs_count_by_exp.get(eid, 0) for eid in experiments)
-
-        if versions_ready == 0:
-            readiness = "\u274c BLOCKED \u2014 all runs deleted"
-        elif versions_blocked > 0:
-            readiness = f"\u26a0\ufe0f PARTIAL \u2014 {versions_ready}/{len(all_versions)} versions migratable"
-        else:
-            readiness = "\u2705 READY"
-
-        rows.append({
-            "source_host": source_host,
-            "target_host": target_host,
-            "model_name": model.name,
-            "readiness": readiness,
-            "source_versions": len(all_versions),
-            "source_versions_migratable": versions_ready,
-            "source_versions_blocked": versions_blocked,
-            "source_experiments": len(experiments),
-            "source_runs": total_runs,
-            "source_params": total_params,
-            "source_metrics": total_metrics,
-            "source_artifacts": total_artifacts,
-            "stages": ", ".join(sorted(stages)) or "None",
-            "owner_emails": ", ".join(sorted(users)),
-            "flavors": " | ".join(sorted(flavors_seen)) if flavors_seen else None,
-            "requirements": representative_meta["requirements"],
-            "python_version": ", ".join(sorted(python_versions_seen)) if python_versions_seen else None,
-            "experiments": " | ".join(sorted(experiment_names)),
-            "latest_version_created": latest_created.strftime("%Y-%m-%d %H:%M") if latest_created else "",
-            "created": datetime.fromtimestamp(model.creation_timestamp / 1000).strftime("%Y-%m-%d") if model.creation_timestamp else "",
-            # Target columns — populated during migration
-            "target_versions": 0,
-            "target_runs": 0,
-            "target_params": 0,
-            "target_metrics": 0,
-            "target_artifacts": 0,
-            "migration_status": "PENDING",
-            "discovery_comments": "; ".join(discovery_comments_parts) if discovery_comments_parts else None,
-            "migration_comments": None,
-            "target_model_url": None,
-            "target_experiment_urls": None,
-            "last_updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        })
+                rows.append({
+                    "source_host": source_host,
+                    "target_host": target_host,
+                    "model_name": model_name,
+                    "readiness": f"\u274c ERROR \u2014 {str(exc)[:60]}",
+                    "source_versions": 0,
+                    "source_versions_migratable": 0,
+                    "source_versions_blocked": 0,
+                    "source_experiments": 0,
+                    "source_runs": 0,
+                    "source_params": 0,
+                    "source_metrics": 0,
+                    "source_artifacts": 0,
+                    "stages": "None",
+                    "owner_emails": "",
+                    "flavors": None,
+                    "requirements": None,
+                    "python_version": None,
+                    "experiments": "",
+                    "latest_version_created": "",
+                    "created": "",
+                    "target_versions": 0,
+                    "target_runs": 0,
+                    "target_params": 0,
+                    "target_metrics": 0,
+                    "target_artifacts": 0,
+                    "migration_status": "PENDING",
+                    "discovery_comments": f"Inventory error: {str(exc)[:120]}",
+                    "migration_comments": None,
+                    "target_model_url": None,
+                    "target_experiment_urls": None,
+                    "last_updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            completed += 1
+            if completed % 50 == 0 or completed == len(models):
+                print(f"  [inventory] {completed}/{len(models)} models processed")
 
     return pd.DataFrame(rows)
 
@@ -403,6 +515,9 @@ def generate_migration_report(
 
 def print_inventory_summary(df: pd.DataFrame) -> None:
     """Print a concise summary header for the inventory report."""
+    if df.empty:
+        print("\u26a0\ufe0f  No models discovered \u2014 check credentials and source connectivity.")
+        return
     ready = len(df[df["readiness"].str.startswith("\u2705")])
     blocked = len(df[df["readiness"].str.startswith("\u274c")])
     partial = len(df[df["readiness"].str.startswith("\u26a0")])
