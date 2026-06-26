@@ -324,12 +324,15 @@ class WorkspaceRegistryMigrator:
         source_credentials: SourceWorkspaceCredentials,
         options: MigrationOptions,
         logger: NotebookLogger | None = None,
+        tracking_table: str | None = None,
     ) -> None:
         options.validate()
         self._configure_runtime_noise()
         self.source_credentials = source_credentials
         self.options = options
         self.logger = logger or NotebookLogger()
+        self.tracking_table = tracking_table
+        self._skipped_versions: list[dict[str, str]] = []
         self.source = SourceWorkspaceContext(source_credentials)
         self.target_workspace = WorkspaceClient()
         self._target_host = self.target_workspace.config.host
@@ -503,6 +506,15 @@ class WorkspaceRegistryMigrator:
                     migrated_models += counts["models"]
                     migrated_versions += counts["versions"]
                     migrated_runs += counts["runs"]
+                    # Real-time Delta tracking update (main thread — Spark SQL safe)
+                    if self.tracking_table:
+                        model_name = counts.get("_model_name", "")
+                        self._update_tracking_table(
+                            model_name=model_name,
+                            migrated_versions=counts["versions"],
+                            migrated_runs=counts["runs"],
+                            failed_versions=[s for s in self._skipped_versions if s["model"] == model_name],
+                        )
         return {"models": migrated_models, "versions": migrated_versions, "runs": migrated_runs}
 
     def _migrate_single_registered_model(
@@ -546,13 +558,112 @@ class WorkspaceRegistryMigrator:
                         self.logger.warning(
                             f"Skipping model version {model.name} v{version.version} because migration failed: {exc}"
                         )
+                        self._skipped_versions.append({
+                            "model": model.name,
+                            "version": str(version.version),
+                            "reason": str(exc)[:120],
+                        })
                         continue
                     migrated_versions += 1
                     migrated_runs += result["runs"]
         self.logger.info(
             f"Migrated registered model {model.name} to {target_model_name} with {migrated_versions} versions"
         )
-        return {"models": 1, "versions": migrated_versions, "runs": migrated_runs}
+        return {"models": 1, "versions": migrated_versions, "runs": migrated_runs, "_model_name": model.name}
+
+    def _update_tracking_table(
+        self,
+        model_name: str,
+        migrated_versions: int,
+        migrated_runs: int,
+        failed_versions: list[dict[str, str]],
+    ) -> None:
+        """Update the Delta tracking table after a model completes migration."""
+        try:
+            from workspace_registry_migrator.reporting import update_tracking_after_model
+            import re
+
+            target_model_name = f"{self.options.model_name_prefix}{model_name}"
+            escaped = target_model_name.replace("'", "''")
+            all_target_versions = self.target.search_model_versions(filter_string=f"name='{escaped}'")
+
+            # BUG 1+2 FIX: Only count versions created by migration (tagged with source_model_version)
+            migrated_target_versions = [
+                tv for tv in all_target_versions
+                if (tv.tags or {}).get("source_model_version")
+            ]
+            total_params = total_metrics = total_artifacts = 0
+            target_experiment_ids: set[str] = set()
+            for tv in migrated_target_versions:
+                if tv.run_id:
+                    try:
+                        run = self.target.get_run(tv.run_id)
+                        total_params += len(run.data.params)
+                        total_metrics += len(run.data.metrics)
+                        total_artifacts += len(self.target.list_artifacts(run_id=tv.run_id, path="model"))
+                        target_experiment_ids.add(run.info.experiment_id)
+                    except Exception:
+                        pass
+
+            # BUG 3 FIX: Determine status by comparing migrated count to source_versions_migratable
+            target_version_count = len(migrated_target_versions)
+            source_migratable = self._get_source_migratable(model_name)
+            if target_version_count >= source_migratable and source_migratable > 0:
+                status = "COMPLETED"
+            elif target_version_count > 0:
+                status = "PARTIAL"
+            elif failed_versions:
+                status = "FAILED"
+            else:
+                status = "SKIPPED"
+
+            comments = "; ".join(f["reason"][:60] for f in failed_versions) if failed_versions else None
+
+            # Build target URLs
+            host = self._target_host.rstrip("/")
+            # Extract workspace ID from Azure host: adb-<workspace_id>.<num>.azuredatabricks.net
+            ws_id_match = re.search(r"adb-(\d+)", host)
+            ws_id = ws_id_match.group(1) if ws_id_match else ""
+            o_param = f"?o={ws_id}" if ws_id else ""
+
+            target_model_url = f"{host}/ml/models/{target_model_name}{o_param}"
+            target_exp_urls = " | ".join(
+                f"{host}/ml/experiments/{eid}" for eid in sorted(target_experiment_ids)
+            ) if target_experiment_ids else None
+
+            update_tracking_after_model(
+                tracking_table=self.tracking_table,
+                source_host=self.source_credentials.normalized_host(),
+                model_name=model_name,
+                target_versions=target_version_count,
+                target_runs=migrated_runs,
+                target_params=total_params,
+                target_metrics=total_metrics,
+                target_artifacts=total_artifacts,
+                migration_status=status,
+                migration_comments=comments,
+                target_model_url=target_model_url,
+                target_experiment_urls=target_exp_urls,
+            )
+        except Exception as exc:
+            self.logger.warning(f"Failed to update tracking table for {model_name}: {exc}")
+
+    def _get_source_migratable(self, model_name: str) -> int:
+        """Read source_versions_migratable from the tracking table for status comparison."""
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if not spark:
+                return 0
+            escaped_host = self.source_credentials.normalized_host().replace("'", "''")
+            escaped_name = model_name.replace("'", "''")
+            row = spark.sql(f"""
+                SELECT source_versions_migratable FROM {self.tracking_table}
+                WHERE source_host = '{escaped_host}' AND model_name = '{escaped_name}'
+            """).first()
+            return row["source_versions_migratable"] if row else 0
+        except Exception:
+            return 0
 
     @_retry_on_rate_limit(max_retries=5, initial_backoff=2.0)
     def _clone_model_version(
@@ -838,6 +949,7 @@ def build_migrator(
     registry_uri: str = "databricks",
     source_client_id: str | None = None,
     source_client_secret: str | None = None,
+    tracking_table: str | None = None,
     **option_overrides: Any,
 ) -> WorkspaceRegistryMigrator:
     """Convenience builder for notebook use."""
@@ -851,4 +963,8 @@ def build_migrator(
     )
     credentials.auth_type()
     options = MigrationOptions(**option_overrides)
-    return WorkspaceRegistryMigrator(source_credentials=credentials, options=options)
+    return WorkspaceRegistryMigrator(
+        source_credentials=credentials,
+        options=options,
+        tracking_table=tracking_table,
+    )

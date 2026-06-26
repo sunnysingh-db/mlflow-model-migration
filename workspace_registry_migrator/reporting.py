@@ -49,11 +49,15 @@ def _parse_model_metadata(run_id: str) -> dict[str, str | None]:
     return result
 
 
-def generate_inventory_report(inventory: DiscoveryBundle) -> pd.DataFrame:
+def generate_inventory_report(
+    inventory: DiscoveryBundle,
+    source_host: str = "",
+    target_host: str = "",
+) -> pd.DataFrame:
     """Generate a model-level pre-migration inventory DataFrame.
 
-    One row per registered model with aggregated metadata:
-    readiness, versions, stages, owners, flavors, requirements, experiments.
+    One row per registered model with aggregated metadata.
+    Includes source_host and target_host for multi-workspace tracking.
     """
     client = _get_client()
     exp_lookup = {e.experiment_id: e for e in inventory.experiments}
@@ -76,6 +80,10 @@ def generate_inventory_report(inventory: DiscoveryBundle) -> pd.DataFrame:
         python_versions_seen: set[str] = set()
         latest_created: datetime | None = None
         representative_meta: dict[str, str | None] = {"flavors": None, "requirements": None, "python_version": None}
+        discovery_comments_parts: list[str] = []
+        total_params = 0
+        total_metrics = 0
+        total_artifacts = 0
 
         for v in all_versions:
             if v.creation_timestamp:
@@ -103,6 +111,12 @@ def generate_inventory_report(inventory: DiscoveryBundle) -> pd.DataFrame:
                     except Exception:
                         experiment_names.add(f"(id: {exp_id})")
                 versions_ready += 1
+                total_params += len(run.data.params)
+                total_metrics += len(run.data.metrics)
+                try:
+                    total_artifacts += len(client.list_artifacts(run_id=v.run_id, path="model"))
+                except Exception:
+                    pass
 
                 meta = _parse_model_metadata(v.run_id)
                 if meta["flavors"]:
@@ -110,8 +124,9 @@ def generate_inventory_report(inventory: DiscoveryBundle) -> pd.DataFrame:
                     representative_meta = meta
                 if meta["python_version"]:
                     python_versions_seen.add(meta["python_version"])
-            except Exception:
+            except Exception as exc:
                 versions_blocked += 1
+                discovery_comments_parts.append(f"v{v.version}: {str(exc)[:80]}")
 
         total_runs = sum(runs_count_by_exp.get(eid, 0) for eid in experiments)
 
@@ -123,24 +138,178 @@ def generate_inventory_report(inventory: DiscoveryBundle) -> pd.DataFrame:
             readiness = "\u2705 READY"
 
         rows.append({
+            "source_host": source_host,
+            "target_host": target_host,
             "model_name": model.name,
             "readiness": readiness,
-            "total_versions": len(all_versions),
-            "versions_migratable": versions_ready,
-            "versions_blocked": versions_blocked,
+            "source_versions": len(all_versions),
+            "source_versions_migratable": versions_ready,
+            "source_versions_blocked": versions_blocked,
+            "source_experiments": len(experiments),
+            "source_runs": total_runs,
+            "source_params": total_params,
+            "source_metrics": total_metrics,
+            "source_artifacts": total_artifacts,
             "stages": ", ".join(sorted(stages)) or "None",
             "owner_emails": ", ".join(sorted(users)),
             "flavors": " | ".join(sorted(flavors_seen)) if flavors_seen else None,
             "requirements": representative_meta["requirements"],
             "python_version": ", ".join(sorted(python_versions_seen)) if python_versions_seen else None,
             "experiments": " | ".join(sorted(experiment_names)),
-            "num_experiments": len(experiments),
-            "total_runs": total_runs,
             "latest_version_created": latest_created.strftime("%Y-%m-%d %H:%M") if latest_created else "",
             "created": datetime.fromtimestamp(model.creation_timestamp / 1000).strftime("%Y-%m-%d") if model.creation_timestamp else "",
+            # Target columns — populated during migration
+            "target_versions": 0,
+            "target_runs": 0,
+            "target_params": 0,
+            "target_metrics": 0,
+            "target_artifacts": 0,
+            "migration_status": "PENDING",
+            "discovery_comments": "; ".join(discovery_comments_parts) if discovery_comments_parts else None,
+            "migration_comments": None,
+            "target_model_url": None,
+            "target_experiment_urls": None,
+            "last_updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         })
 
     return pd.DataFrame(rows)
+
+
+def write_inventory_to_delta(
+    inventory_df: pd.DataFrame,
+    tracking_table: str,
+) -> None:
+    """MERGE inventory DataFrame into the Delta tracking table.
+
+    Creates the table if it doesn't exist. Uses (source_host, model_name) as key.
+    Only updates source-side columns; preserves target-side and migration_comments from prior migrations.
+    """
+    from pyspark.sql import SparkSession
+    from pyspark.sql.functions import current_timestamp
+
+    spark = SparkSession.getActiveSession()
+    if spark is None:
+        raise RuntimeError("No active SparkSession")
+
+    sdf = spark.createDataFrame(inventory_df)
+    sdf = sdf.withColumn("last_updated_at", current_timestamp())
+    sdf.createOrReplaceTempView("_inventory_staging")
+
+    # Create table if not exists
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {tracking_table} (
+            source_host STRING,
+            target_host STRING,
+            model_name STRING,
+            readiness STRING,
+            source_versions INT,
+            source_versions_migratable INT,
+            source_versions_blocked INT,
+            source_experiments INT,
+            source_runs INT,
+            source_params INT,
+            source_metrics INT,
+            source_artifacts INT,
+            stages STRING,
+            owner_emails STRING,
+            flavors STRING,
+            requirements STRING,
+            python_version STRING,
+            experiments STRING,
+            latest_version_created STRING,
+            created STRING,
+            target_versions INT,
+            target_runs INT,
+            target_params INT,
+            target_metrics INT,
+            target_artifacts INT,
+            migration_status STRING,
+            discovery_comments STRING,
+            migration_comments STRING,
+            target_model_url STRING,
+            target_experiment_urls STRING,
+            last_updated_at TIMESTAMP
+        )
+        USING DELTA
+    """)
+
+    spark.sql(f"""
+        MERGE INTO {tracking_table} AS target
+        USING _inventory_staging AS source
+        ON target.source_host = source.source_host AND target.model_name = source.model_name
+        WHEN MATCHED THEN UPDATE SET
+            target.target_host = source.target_host,
+            target.readiness = source.readiness,
+            target.source_versions = source.source_versions,
+            target.source_versions_migratable = source.source_versions_migratable,
+            target.source_versions_blocked = source.source_versions_blocked,
+            target.source_experiments = source.source_experiments,
+            target.source_runs = source.source_runs,
+            target.source_params = source.source_params,
+            target.source_metrics = source.source_metrics,
+            target.source_artifacts = source.source_artifacts,
+            target.stages = source.stages,
+            target.owner_emails = source.owner_emails,
+            target.flavors = source.flavors,
+            target.requirements = source.requirements,
+            target.python_version = source.python_version,
+            target.experiments = source.experiments,
+            target.latest_version_created = source.latest_version_created,
+            target.created = source.created,
+            target.discovery_comments = source.discovery_comments,
+            target.last_updated_at = current_timestamp()
+        WHEN NOT MATCHED THEN INSERT *
+    """)
+    spark.sql("DROP VIEW IF EXISTS _inventory_staging")
+    print(f"\u2705 Inventory MERGED into {tracking_table} ({len(inventory_df)} models)")
+
+
+def update_tracking_after_model(
+    tracking_table: str,
+    source_host: str,
+    model_name: str,
+    target_versions: int,
+    target_runs: int,
+    target_params: int,
+    target_metrics: int,
+    target_artifacts: int,
+    migration_status: str,
+    migration_comments: str | None = None,
+    target_model_url: str | None = None,
+    target_experiment_urls: str | None = None,
+) -> None:
+    """Update target-side columns in the tracking table after a model is migrated.
+
+    Called by the framework after each model completes migration.
+    Only writes to migration_comments — never touches discovery_comments.
+    """
+    from pyspark.sql import SparkSession
+
+    spark = SparkSession.getActiveSession()
+    if spark is None:
+        return  # silently skip if no Spark (e.g., unit tests)
+
+    escaped_host = source_host.replace("'", "''")
+    escaped_name = model_name.replace("'", "''")
+    comments_sql = f"'{migration_comments.replace(chr(39), chr(39)+chr(39))}'" if migration_comments else "NULL"
+    model_url_sql = f"'{target_model_url.replace(chr(39), chr(39)+chr(39))}'" if target_model_url else "NULL"
+    exp_urls_sql = f"'{target_experiment_urls.replace(chr(39), chr(39)+chr(39))}'" if target_experiment_urls else "NULL"
+
+    spark.sql(f"""
+        UPDATE {tracking_table}
+        SET
+            target_versions = {target_versions},
+            target_runs = {target_runs},
+            target_params = {target_params},
+            target_metrics = {target_metrics},
+            target_artifacts = {target_artifacts},
+            migration_status = '{migration_status}',
+            migration_comments = {comments_sql},
+            target_model_url = {model_url_sql},
+            target_experiment_urls = {exp_urls_sql},
+            last_updated_at = current_timestamp()
+        WHERE source_host = '{escaped_host}' AND model_name = '{escaped_name}'
+    """)
 
 
 def generate_migration_report(
@@ -237,8 +406,8 @@ def print_inventory_summary(df: pd.DataFrame) -> None:
     ready = len(df[df["readiness"].str.startswith("\u2705")])
     blocked = len(df[df["readiness"].str.startswith("\u274c")])
     partial = len(df[df["readiness"].str.startswith("\u26a0")])
-    total_versions = int(df["total_versions"].sum())
-    migratable = int(df["versions_migratable"].sum())
+    total_versions = int(df["source_versions"].sum())
+    migratable = int(df["source_versions_migratable"].sum())
     owners = len(set().union(*[set(r.split(", ")) for r in df["owner_emails"] if r]))
 
     print(f"PRE-MIGRATION INVENTORY: {len(df)} models, {total_versions} versions ({migratable} migratable)")
