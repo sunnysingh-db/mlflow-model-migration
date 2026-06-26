@@ -130,6 +130,12 @@ def _process_single_model(
         if v.user_id:
             users.add(v.user_id)
 
+
+        # Skip versions with no run_id — still migratable (model artifact registered directly)
+        if not v.run_id:
+            versions_ready += 1
+            continue
+
         try:
             run = client.get_run(v.run_id)
             user_email = run.data.tags.get("mlflow.user", v.user_id or "")

@@ -267,15 +267,25 @@ class SourceWorkspaceContext:
         return self.with_client(_load)
 
     def search_model_versions(self, model_name: str) -> list[ModelVersion]:
+        """Paginated search_model_versions — fetches ALL versions."""
         escaped_name = model_name.replace("'", "''")
-        return self.with_client(
-            lambda client: list(
-                client.search_model_versions(
+
+        def _paginated_search(client: MlflowClient) -> list[ModelVersion]:
+            all_versions: list[ModelVersion] = []
+            page_token: str | None = None
+            while True:
+                page = client.search_model_versions(
                     filter_string=f"name='{escaped_name}'",
-                    max_results=10000,
+                    max_results=1000,
+                    page_token=page_token,
                 )
-            )
-        )
+                all_versions.extend(list(page))
+                page_token = getattr(page, "token", None)
+                if not page_token:
+                    return all_versions
+            return all_versions
+
+        return self.with_client(_paginated_search)
 
     def get_run(self, run_id: str) -> Run:
         return self.with_client(lambda client: client.get_run(run_id))
@@ -289,16 +299,31 @@ class SourceWorkspaceContext:
         include_deleted_runs: bool,
         max_runs: int | None,
     ) -> list[Run]:
-        return self.with_client(
-            lambda client: list(
-                client.search_runs(
+        """Paginated search_runs — fetches ALL runs unless max_runs is set."""
+        def _paginated_search(client: MlflowClient) -> list[Run]:
+            all_runs: list[Run] = []
+            page_token: str | None = None
+            page_size = 1000  # max page size per API call
+            run_view = 3 if include_deleted_runs else 1
+            while True:
+                page = client.search_runs(
                     experiment_ids=[experiment_id],
-                    run_view_type=3 if include_deleted_runs else 1,
-                    max_results=max_runs or 1000,
+                    run_view_type=run_view,
+                    max_results=page_size,
                     order_by=["attributes.start_time DESC"],
+                    page_token=page_token,
                 )
-            )
-        )
+                all_runs.extend(page)
+                # Respect user-configured max_runs cap
+                if max_runs and len(all_runs) >= max_runs:
+                    return all_runs[:max_runs]
+                # Check for next page
+                page_token = getattr(page, "token", None)
+                if not page_token:
+                    return all_runs
+            return all_runs
+
+        return self.with_client(_paginated_search)
 
     def get_metric_history(self, run_id: str, key: str) -> list[Metric]:
         return self.with_client(lambda client: client.get_metric_history(run_id, key))
@@ -385,6 +410,105 @@ class WorkspaceRegistryMigrator:
             migrated_model_versions=model_counts["versions"],
             migrated_experiments=len(experiment_name_map),
             migrated_runs=model_counts["runs"],
+        )
+
+    def migrate_pending(self) -> MigrationSummary:
+        """Resume migration for PENDING models only — reads from tracking table.
+
+        Unlike migrate_all() which re-discovers ALL source models, this method:
+        1. Queries the tracking table for models with migration_status = 'PENDING'
+        2. Discovers only those specific models (targeted discovery)
+        3. Migrates only the pending models
+
+        This is much faster for resuming large migrations (e.g., 900 models where
+        700 are already COMPLETED — only processes the remaining 200).
+
+        Requires: tracking_table must be set and populated by a prior discover run.
+        """
+        if not self.tracking_table:
+            raise ValueError(
+                "migrate_pending() requires a tracking_table. "
+                "Run the discover cell first to populate it, then use migrate_pending()."
+            )
+
+        from pyspark.sql import SparkSession
+        spark = SparkSession.getActiveSession()
+        if not spark:
+            raise RuntimeError("No active SparkSession")
+
+        # 1. Read PENDING models from tracking table
+        escaped_host = self.source_credentials.normalized_host().replace("'", "''")
+        pending_rows = spark.sql(f"""
+            SELECT model_name FROM {self.tracking_table}
+            WHERE migration_status = 'PENDING'
+              AND source_host = '{escaped_host}'
+        """).collect()
+
+        pending_names = [row["model_name"] for row in pending_rows]
+        if not pending_names:
+            self.logger.info("No PENDING models found in tracking table — nothing to migrate.")
+            return MigrationSummary(
+                migrated_models=0, migrated_model_versions=0,
+                migrated_experiments=0, migrated_runs=0,
+            )
+
+        self.logger.info(f"Found {len(pending_names)} PENDING models to migrate")
+
+        # 2. Targeted discovery — only for pending models
+        bundle = self._discover_models(pending_names)
+
+        # 3. Migrate experiments + models
+        experiment_name_map = self._migrate_experiments(bundle)
+        model_counts = self._migrate_models(bundle, experiment_name_map)
+
+        return MigrationSummary(
+            migrated_models=model_counts["models"],
+            migrated_model_versions=model_counts["versions"],
+            migrated_experiments=len(experiment_name_map),
+            migrated_runs=model_counts["runs"],
+        )
+
+    def _discover_models(self, model_names: list[str]) -> "DiscoveryBundle":
+        """Targeted discovery for a specific list of model names."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Fetch model objects from source (filter to requested names)
+        all_models = self.source.search_registered_models()
+        requested = {name.strip() for name in model_names}
+        registered_models = [m for m in all_models if m.name.strip() in requested]
+
+        for model in registered_models:
+            self.logger.info(f"Discovered model {model.name}")
+
+        # Fetch versions in parallel
+        model_versions_by_name: dict[str, list[ModelVersion]] = {}
+        if registered_models:
+            with ThreadPoolExecutor(max_workers=min(self.options.max_workers, len(registered_models))) as pool:
+                future_map = {
+                    pool.submit(self._list_model_versions, model.name): model.name
+                    for model in registered_models
+                }
+                for future in as_completed(future_map):
+                    model_versions_by_name[future_map[future]] = future.result()
+
+        # Discover experiments + runs for these models only
+        experiments = self._list_experiments(registered_models, model_versions_by_name)
+        runs_by_experiment_id: dict[str, list[Run]] = {}
+        if experiments:
+            with ThreadPoolExecutor(max_workers=min(self.options.max_workers, len(experiments))) as pool:
+                future_map = {
+                    pool.submit(self._list_runs, experiment.experiment_id): experiment.experiment_id
+                    for experiment in experiments
+                }
+                for future in as_completed(future_map):
+                    runs_by_experiment_id[future_map[future]] = future.result()
+
+        self.logger.info(f"Discovered {len(experiments)} source experiments")
+        return DiscoveryBundle(
+            registered_models=registered_models,
+            model_versions_by_name=model_versions_by_name,
+            experiments=experiments,
+            runs_by_experiment_id=runs_by_experiment_id,
         )
 
     def _list_registered_models(self) -> list[RegisteredModel]:

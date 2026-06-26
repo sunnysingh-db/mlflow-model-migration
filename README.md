@@ -1,6 +1,6 @@
 # MLflow Workspace Registry Migration Framework
 
-Bulk-migrates MLflow **workspace registry** models, experiments, runs, and artifacts from a source Databricks workspace into the current (target) workspace.
+Bulk-migrates MLflow **workspace registry** models, experiments, runs, and artifacts from a source Databricks workspace into the current (target) workspace. Tracks progress in a Delta table for **resumable migrations**.
 
 ---
 
@@ -24,7 +24,8 @@ mlflow-model-migration/
 ├── Workspace Registry Migration       ← Main notebook (run this)
 └── workspace_registry_migrator/       ← Framework package
     ├── __init__.py
-    ├── framework.py                   ← Core migration logic
+    ├── framework.py                   ← Core migration logic + migrate_pending()
+    ├── reporting.py                   ← Inventory reports, Delta tracking, URLs
     ├── config.py                      ← Configuration helpers
     ├── clients.py                     ← Client wrappers
     └── utils.py                       ← Utilities (logging, chunking, temp dirs)
@@ -69,40 +70,46 @@ mlflow-model-migration/
 
 ## Execution Flow
 
+The framework operates in two phases: **Discover** (builds inventory) and **Migrate** (processes PENDING models from tracking table).
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Cell 1-2: Documentation (no execution needed)                  │
 ├─────────────────────────────────────────────────────────────────┤
 │  Cell 3: Setup Imports                                          │
-│  • Adds project to sys.path                                     │
-│  • Reloads framework module (picks up latest code changes)      │
+│  • Adds project to sys.path, force-reloads framework            │
 ├─────────────────────────────────────────────────────────────────┤
 │  Cell 4: Source Workspace Credentials                           │
-│  • Set AUTH_MODE = "pat" or "service_principal"                  │
-│  • Configure SOURCE_HOST, SOURCE_TOKEN (or SP credentials)      │
-│  • Validates connectivity                                       │
+│  • AUTH_MODE = "pat" or "service_principal"                      │
+│  • SOURCE_HOST, TOKEN or SP_CLIENT_ID/SECRET                    │
 ├─────────────────────────────────────────────────────────────────┤
-│  Cell 5: Migration Options                                      │
-│  • Configure prefixes, batch size, limits                       │
-│  • Set extra_model_names allowlist (or [] for all models)       │
+│  Cell 5: Migration Options + Tracking Table Config              │
+│  • TRACKING_TABLE = catalog.schema.table                        │
+│  • Prefixes, batch_size, max_workers, allowlists                │
 ├─────────────────────────────────────────────────────────────────┤
-│  Cell 6: Discover Source Assets                                 │
-│  • Probes source workspace                                      │
-│  • Filters inaccessible versions (deleted runs)                 │
-│  • Returns inventory summary                                    │
+│  Cell 6: Discover Source Assets (Phase 1)                       │
+│  • Discovers ALL models from source (parallelized)              │
+│  • Generates inventory report (parallel, 20 workers)            │
+│  • MERGEs to Delta tracking table (all start as PENDING)        │
+│  • include_metadata=True/False controls artifact downloads      │
 ├─────────────────────────────────────────────────────────────────┤
-│  Cell 7: Run Bulk Migration                                     │
-│  • Creates experiments under /Shared                            │
-│  • Clones runs (params, metrics, tags, artifacts)               │
-│  • Registers model versions with full dbfs:/ paths              │
-│  • Returns MigrationSummary with skipped_versions detail        │
+│  Cell 7: Run Bulk Migration (Phase 2)                           │
+│  • migrate_pending(): reads PENDING from tracking table         │
+│  • Targeted discovery — only for pending models                 │
+│  • Updates tracking table per-model (COMPLETED/PARTIAL/FAILED)  │
+│  • Populates target_model_url + target_experiment_urls           │
 ├─────────────────────────────────────────────────────────────────┤
 │  Cell 8: Migration Report                                       │
-│  • Generates per-version comparison DataFrame                   │
-│  • Shows: status, params match, metrics match, artifacts match  │
-│  • Surfaces skipped versions with failure reasons               │
+│  • Displays tracking table grouped by status                    │
+│  • Shows: COMPLETED, PARTIAL, PENDING, FAILED counts            │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### Resume Behavior
+
+Re-running **cell 7** after a partial migration only processes models still in `PENDING` state.
+Already-completed models are skipped entirely — no re-discovery, no redundant API calls.
+For 900 models where 700 are done, it only touches the remaining 200.
 
 ---
 
@@ -134,13 +141,13 @@ SP_CLIENT_SECRET = dbutils.secrets.get("migration-scope", "sp-client-secret")
 | `experiment_name_prefix` | Prefix for target experiment names | `""` |
 | `extra_model_names` | Allowlist of model names to migrate (`[]` = all) | `[]` |
 | `max_model_versions_per_model` | Max versions per model (`None` = all) | `None` |
-| `max_runs_per_experiment` | Max runs per experiment (`None` = all) | `None` |
-| `skip_existing_model_versions` | Skip versions already in target | `False` |
+| `max_runs_per_experiment` | Max runs per experiment (`None` = all, fully paginated) | `None` |
+| `skip_existing_model_versions` | Skip versions already in target (by tag match) | `True` |
 | `download_artifacts` | Controls non-model artifact transfer (see below) | `True` |
 | `include_run_artifacts` | Whether to invoke artifact copy at all | `True` |
-| `include_deleted_runs` | Include soft-deleted runs | `False` |
-| `batch_size` | Models/experiments per batch | `10` |
-| `max_workers` | Thread pool concurrency | `10` |
+| `include_deleted_runs` | Include soft-deleted runs | `True` |
+| `batch_size` | Models/experiments per parallel batch | `20` |
+| `max_workers` | Thread pool concurrency | `20` |
 
 ### Step 3: Run Discovery (Cell 6)
 
@@ -240,26 +247,33 @@ artifacts/
 The framework uses **parallel execution** at multiple levels:
 
 ```
-migrate_all()
+migrate_pending()
+├── Query tracking table for PENDING models
+├── _discover_models(pending_names)         ← targeted discovery
+│   ├── ThreadPoolExecutor: fetch versions    ← parallel per model
+│   └── ThreadPoolExecutor: fetch runs        ← parallel per experiment
 ├── _migrate_experiments()
-│   └── for batch in chunked(experiments, batch_size):     ← sequential across batches
-│       └── ThreadPoolExecutor(max_workers)                ← parallel within batch
-│           └── _migrate_single_experiment(exp)
-│               └── ThreadPoolExecutor(max_workers)        ← parallel runs within experiment
-│                   └── _clone_run(run)
-│
+│   └── for batch in chunked(experiments, batch_size):   ← batched
+│       └── ThreadPoolExecutor(max_workers)              ← parallel
 └── _migrate_models()
-    └── for batch in chunked(models, batch_size):          ← sequential across batches
-        └── ThreadPoolExecutor(max_workers)                ← parallel within batch
+    └── for batch in chunked(models, batch_size):        ← batched
+        └── ThreadPoolExecutor(max_workers)              ← parallel
             └── _migrate_single_registered_model(model)
-                └── ThreadPoolExecutor(max_workers)        ← parallel versions within model
-                    └── _clone_model_version(version)
+        └── _update_tracking_table()                     ← main thread (Spark-safe)
+
+generate_inventory_report()
+└── ThreadPoolExecutor(max_workers=20)                  ← parallel per model
+    └── _process_single_model(model)
+        └── search_model_versions + get_run per version
+        └── _parse_model_metadata (if include_metadata=True)
 ```
 
+**Important**: Delta tracking table updates (`spark.sql(UPDATE ...)`) run on the **main thread** after each model’s future completes — Spark SQL is NOT thread-safe on serverless.
+
 **Tuning guidance:**
-- `max_workers=10-12` — good default; balances throughput vs API rate limits
-- `max_workers=4-6` — use if you're hitting 429 rate limits on source workspace
-- `batch_size=8-10` — controls memory; larger batches hold more futures in memory
+- `max_workers=20` — good default for serverless (no cluster to saturate)
+- `max_workers=6-8` — use if hitting 429 rate limits on source workspace
+- `batch_size=20` — controls memory; larger batches hold more futures
 
 ---
 
@@ -267,25 +281,70 @@ migrate_all()
 
 | Scenario | Behavior |
 | --- | --- |
-| Source run deleted | Filtered during discovery; reported as `RUN_DELETED` |
-| Model artifacts purged | Caught before `create_model_version`; reported as `NO_ARTIFACTS` |
+| Source run deleted | Reported in `discovery_comments`; version counted as blocked |
+| Version with `run_id=None` | Counted as migratable (artifact-only registration) |
+| Model artifacts purged | Caught before `create_model_version`; reported in `migration_comments` |
 | Artifact with empty path | Skipped individually; other artifacts still copied |
 | Rate limiting (429) | Automatic retry with exponential backoff (5 attempts) |
-| Duplicate model version | Skipped when `skip_existing_model_versions=True` |
+| Duplicate model version | Skipped when `skip_existing_model_versions=True` (tag-based) |
 | Trailing whitespace in model names | Auto-stripped during allowlist matching |
 | Thread-safety (env vars) | Global lock prevents source/target credential pollution |
+| Thread-safety (Spark SQL) | Tracking updates run on main thread after future.result() |
 | Transient server errors (500/503) | Retried automatically |
+| Same-workspace test | Target counts only include tagged versions (excludes originals) |
+| Cross-workspace env leak | `try/finally` in reporting guarantees env restoration |
+
+---
+
+## Delta Tracking Table
+
+The migration state is persisted in a Unity Catalog Delta table (configured via `TRACKING_TABLE` in cell 5).
+
+**Primary key**: `(source_host, model_name)` — multi-workspace safe.
+
+### Key Columns
+
+| Column | Populated by | Notes |
+| --- | --- | --- |
+| `source_host` | Discovery | Part of PK |
+| `model_name` | Discovery | Part of PK |
+| `readiness` | Discovery | ✅ READY / ⚠️ PARTIAL / ❌ BLOCKED |
+| `source_versions` | Discovery | Total versions in source |
+| `source_versions_migratable` | Discovery | Versions with accessible runs |
+| `source_params` / `metrics` / `artifacts` | Discovery | Aggregate counts from source |
+| `target_versions` | Migration | Versions with `source_model_version` tag in target |
+| `target_params` / `metrics` / `artifacts` | Migration | Counts from migrated versions only |
+| `migration_status` | Both | PENDING → COMPLETED / PARTIAL / FAILED / SKIPPED |
+| `target_model_url` | Migration | Clickable URL to target model |
+| `target_experiment_urls` | Migration | Pipe-separated experiment URLs |
+| `discovery_comments` | Discovery | Per-version error messages |
+| `migration_comments` | Migration | Per-version failure reasons |
+
+### MERGE Behavior
+
+- **Discovery** (cell 6): `WHEN MATCHED` updates only source-side columns. Never overwrites target-side data.
+- **Migration** (cell 7): `UPDATE` only writes to target-side columns + `migration_status`.
+- **Safe to re-run discovery** without losing migration progress.
+
+### Migration Status Logic
+
+| Status | Condition |
+| --- | --- |
+| `COMPLETED` | Target tagged versions ≥ source migratable versions |
+| `PARTIAL` | Some versions migrated but not all |
+| `FAILED` | Zero versions migrated + errors encountered |
+| `SKIPPED` | Zero versions migrated, no errors (nothing to do) |
 
 ---
 
 ## Re-running After Failures
 
-The framework is **idempotent**:
+The framework is **idempotent** at multiple levels:
 
-1. Existing target runs are detected by `source_run_id` tag — not re-created.
-2. Existing model versions are detected by `source_model_version` tag.
-3. Set `skip_existing_model_versions=True` to skip already-migrated versions.
-4. Set `skip_existing_model_versions=False` to force re-attempt of failed versions.
+1. **Tracking table**: `migrate_pending()` only processes `PENDING` models — skips COMPLETED/PARTIAL/FAILED entirely.
+2. **Version dedup**: `skip_existing_model_versions=True` checks for `source_model_version` tag in target.
+3. **Run dedup**: Existing target runs detected by `source_run_id` tag — not re-created.
+4. **Reset to retry failures**: `UPDATE tracking_table SET migration_status = 'PENDING' WHERE migration_status = 'FAILED'`
 
 ---
 
@@ -294,8 +353,14 @@ The framework is **idempotent**:
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `0 models discovered` | `extra_model_names` doesn't match source names | Check for typos/whitespace; set `[]` for all models |
-| `INVALID_PARAMETER_VALUE: Got an invalid source` | Old framework version without dbfs path fix | Re-run cell 3 to reload framework |
-| `RESOURCE_DOES_NOT_EXIST` | Source run was deleted | Cannot be recovered — reported in summary |
-| `Parameter 'path' must be a non-empty string` | Corrupted artifact entry in source run | Handled automatically — skipped with warning |
-| Migration hangs | Rate limiting on source workspace | Reduce `max_workers` to 4-6 |
+| `⚠️ No models discovered` | Credentials not configured or empty | Fill in SOURCE_HOST + credentials in cell 4 |
+| `KeyError: 'readiness'` | Empty inventory DataFrame (0 models) | Fixed: `print_inventory_summary` now handles empty DFs |
+| All models show `❌ BLOCKED` | `generate_inventory_report` was using wrong client | Fixed: pass `source_context=migrator.source` |
+| `source_runs = 1000` for all models | Pagination cap in `search_runs` | Fixed: now paginates fully (set `max_runs_per_experiment` to cap) |
+| `expected string or bytes-like object, got NoneType` | Model version has `run_id=None` | Fixed: versions without runs counted as ready |
+| `INVALID_PARAMETER_VALUE: Got an invalid source` | Old framework in memory | Re-run cell 3 to reload framework |
+| `RESOURCE_DOES_NOT_EXIST` | Source run was permanently deleted | Reported in `discovery_comments`; version blocked |
+| Migration hangs | Rate limiting on source workspace | Reduce `max_workers` to 6-8 |
 | Duplicate version error | Version already exists in target | Set `skip_existing_model_versions=True` |
+| Tracking table not updating | Spark SQL called from worker thread | Fixed: updates run on main thread after `future.result()` |
+| Target counts > source counts | Same-workspace test (versions accumulate) | Expected; real cross-workspace migration won't have this |
