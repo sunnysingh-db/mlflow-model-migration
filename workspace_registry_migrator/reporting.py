@@ -11,7 +11,7 @@ import pandas as pd
 import yaml
 from mlflow import MlflowClient
 
-from workspace_registry_migrator.framework import DiscoveryBundle, MigrationOptions
+from workspace_registry_migrator.framework_v2 import DiscoveryBundle, MigrationOptions
 
 
 def _get_client() -> MlflowClient:
@@ -386,48 +386,94 @@ def update_tracking_after_model(
     tracking_table: str,
     source_host: str,
     model_name: str,
-    target_versions: int,
-    target_runs: int,
-    target_params: int,
-    target_metrics: int,
-    target_artifacts: int,
+    target_versions: int | None,
+    target_runs: int | None,
+    target_params: int | None,
+    target_metrics: int | None,
+    target_artifacts: int | None,
     migration_status: str,
     migration_comments: str | None = None,
     target_model_url: str | None = None,
     target_experiment_urls: str | None = None,
 ) -> None:
-    """Update target-side columns in the tracking table after a model is migrated.
+    """MERGE target-side tracking fields for a single model.
 
-    Called by the framework after each model completes migration.
-    Only writes to migration_comments — never touches discovery_comments.
+    Called by the framework after each model changes state. Discovery rows are
+    expected to be written first, but this method still uses MERGE semantics so
+    status updates remain idempotent and resumable.
     """
     from pyspark.sql import SparkSession
 
     spark = SparkSession.getActiveSession()
     if spark is None:
-        return  # silently skip if no Spark (e.g., unit tests)
+        return
 
-    escaped_host = source_host.replace("'", "''")
-    escaped_name = model_name.replace("'", "''")
-    comments_sql = f"'{migration_comments.replace(chr(39), chr(39)+chr(39))}'" if migration_comments else "NULL"
-    model_url_sql = f"'{target_model_url.replace(chr(39), chr(39)+chr(39))}'" if target_model_url else "NULL"
-    exp_urls_sql = f"'{target_experiment_urls.replace(chr(39), chr(39)+chr(39))}'" if target_experiment_urls else "NULL"
+    staging_schema = (
+        "source_host string, model_name string, target_versions int, target_runs int, "
+        "target_params int, target_metrics int, target_artifacts int, migration_status string, "
+        "migration_comments string, target_model_url string, target_experiment_urls string"
+    )
+    staging_row = [(
+        source_host,
+        model_name,
+        target_versions,
+        target_runs,
+        target_params,
+        target_metrics,
+        target_artifacts,
+        migration_status,
+        migration_comments,
+        target_model_url,
+        target_experiment_urls,
+    )]
+    spark.createDataFrame(staging_row, schema=staging_schema).createOrReplaceTempView(
+        "_tracking_model_update"
+    )
 
     spark.sql(f"""
-        UPDATE {tracking_table}
-        SET
-            target_versions = {target_versions},
-            target_runs = {target_runs},
-            target_params = {target_params},
-            target_metrics = {target_metrics},
-            target_artifacts = {target_artifacts},
-            migration_status = '{migration_status}',
-            migration_comments = {comments_sql},
-            target_model_url = {model_url_sql},
-            target_experiment_urls = {exp_urls_sql},
-            last_updated_at = current_timestamp()
-        WHERE source_host = '{escaped_host}' AND model_name = '{escaped_name}'
+        MERGE INTO {tracking_table} AS target
+        USING _tracking_model_update AS source
+        ON target.source_host = source.source_host AND target.model_name = source.model_name
+        WHEN MATCHED THEN UPDATE SET
+            target.target_versions = COALESCE(source.target_versions, target.target_versions),
+            target.target_runs = COALESCE(source.target_runs, target.target_runs),
+            target.target_params = COALESCE(source.target_params, target.target_params),
+            target.target_metrics = COALESCE(source.target_metrics, target.target_metrics),
+            target.target_artifacts = COALESCE(source.target_artifacts, target.target_artifacts),
+            target.migration_status = source.migration_status,
+            target.migration_comments = COALESCE(source.migration_comments, target.migration_comments),
+            target.target_model_url = COALESCE(source.target_model_url, target.target_model_url),
+            target.target_experiment_urls = COALESCE(source.target_experiment_urls, target.target_experiment_urls),
+            target.last_updated_at = current_timestamp()
+        WHEN NOT MATCHED THEN INSERT (
+            source_host,
+            model_name,
+            target_versions,
+            target_runs,
+            target_params,
+            target_metrics,
+            target_artifacts,
+            migration_status,
+            migration_comments,
+            target_model_url,
+            target_experiment_urls,
+            last_updated_at
+        ) VALUES (
+            source.source_host,
+            source.model_name,
+            source.target_versions,
+            source.target_runs,
+            source.target_params,
+            source.target_metrics,
+            source.target_artifacts,
+            source.migration_status,
+            source.migration_comments,
+            source.target_model_url,
+            source.target_experiment_urls,
+            current_timestamp()
+        )
     """)
+    spark.sql("DROP VIEW IF EXISTS _tracking_model_update")
 
 
 def generate_migration_report(

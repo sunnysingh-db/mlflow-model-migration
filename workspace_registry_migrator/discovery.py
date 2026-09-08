@@ -1,13 +1,6 @@
+# DEPRECATED — this module is dead code. All logic lives in framework.py.
+# Safe to delete this file.
 from __future__ import annotations
-
-from dataclasses import dataclass
-
-from mlflow.entities import Experiment, Run
-from mlflow.entities.model_registry import ModelVersion, RegisteredModel
-
-from workspace_registry_migrator.clients import WorkspaceClients
-from workspace_registry_migrator.config import MigrationOptions
-from workspace_registry_migrator.utils import NotebookLogger
 
 
 @dataclass(frozen=True)

@@ -1,25 +1,6 @@
+# DEPRECATED — this module is dead code. All logic lives in framework.py.
+# Safe to delete this file.
 from __future__ import annotations
-
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-
-import mlflow
-from mlflow.entities import Experiment, Run
-from mlflow.entities.model_registry import ModelVersion, RegisteredModel
-from mlflow.tracking import MlflowClient
-
-from workspace_registry_migrator.clients import (
-    WorkspaceClients,
-    create_source_clients,
-    create_target_clients,
-    mlflow_environment,
-)
-from workspace_registry_migrator.config import MigrationOptions, SourceWorkspaceCredentials
-from workspace_registry_migrator.discovery import DiscoveryBundle, WorkspaceRegistryDiscovery
-from workspace_registry_migrator.utils import NotebookLogger, chunked, ensure_directory, sanitize_name, temporary_directory
 
 
 @dataclass(frozen=True)

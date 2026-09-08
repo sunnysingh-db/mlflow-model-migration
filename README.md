@@ -1,366 +1,604 @@
-# MLflow Workspace Registry Migration Framework
+# 🚀 MLflow Model Migration Framework
 
-Bulk-migrates MLflow **workspace registry** models, experiments, runs, and artifacts from a source Databricks workspace into the current (target) workspace. Tracks progress in a Delta table for **resumable migrations**.
+Bulk-migrate MLflow models, experiments, runs & artifacts between Databricks workspaces.
+Supports **4 migration paths**, tracks progress in Delta, and **resumes where it left off**.
 
 ---
 
-## What Gets Migrated
+## 📋 What Gets Migrated
 
-| Asset | Details |
+| Asset | What's Copied |
 | --- | --- |
-| Registered Models | Name, description, tags |
-| Model Versions | Source path, stage, tags, description |
-| Experiments | Name, tags (placed under `/Shared`) |
-| Runs | Parameters, metrics (full history), tags, status |
-| Artifacts | Model files (MLmodel, pkl, conda.yaml, etc.) and optionally all run artifacts |
+| 🏷️ Registered Models | Name, description, tags |
+| 📦 Model Versions | Source path, stage → alias mapping, tags, description |
+| 🧪 Experiments | Name, tags (target: `/Shared/mlflow-workspace-migration/`) |
+| 🏃 Runs | Params, full metric history, tags, status |
+| 📁 Artifacts | Model files (MLmodel, pkl, conda.yaml…) + optionally all run artifacts |
 
 ---
 
-## Project Structure
+## 🗺️ Supported Migration Scenarios
+
+| # | Source → Target | Use Case | Key Config |
+| --- | --- | --- | --- |
+| 1️⃣ | **Workspace → Workspace** | Clone models to another workspace (or same with prefix) | `SOURCE_REGISTRY="workspace"`, `TARGET_REGISTRY="workspace"`, set `MODEL_NAME_PREFIX` |
+| 2️⃣ | **Workspace → Unity Catalog** | Upgrade legacy WS models to UC | `SOURCE_REGISTRY="workspace"`, `TARGET_REGISTRY="uc"`, set `UC_TARGET_CATALOG` + `UC_TARGET_SCHEMA` |
+| 3️⃣ | **Unity Catalog → Unity Catalog** | Move UC models across catalogs/schemas | `SOURCE_REGISTRY="uc"`, `TARGET_REGISTRY="uc"`, set `UC_TARGET_CATALOG` + `UC_TARGET_SCHEMA` |
+| 4️⃣ | **Unity Catalog → Workspace** | Downgrade UC models back to legacy registry | `SOURCE_REGISTRY="uc"`, `TARGET_REGISTRY="workspace"`, set `MODEL_NAME_PREFIX` |
+
+> 💡 **Same-workspace?** Set `SOURCE_HOST` to your current workspace URL. Use `MODEL_NAME_PREFIX` (WS targets) or a different `UC_TARGET_SCHEMA` (UC targets) to avoid overwriting source models.
+
+---
+
+## 📂 Project Structure
 
 ```
 mlflow-model-migration/
-├── README.md                          ← You are here
-├── Workspace Registry Migration       ← Main notebook (run this)
-└── workspace_registry_migrator/       ← Framework package
+├── README.md                              ← 📖 You are here
+├── Workspace Registry Migration           ← 🎯 Main notebook (run this!)
+└── workspace_registry_migrator/           ← ⚙️ Framework package
     ├── __init__.py
-    ├── framework.py                   ← Core migration logic + migrate_pending()
-    ├── reporting.py                   ← Inventory reports, Delta tracking, URLs
-    ├── config.py                      ← Configuration helpers
-    ├── clients.py                     ← Client wrappers
-    └── utils.py                       ← Utilities (logging, chunking, temp dirs)
+    ├── framework_v2.py                    ← Core migration engine
+    ├── notebook_helpers.py                ← Notebook-friendly wrapper
+    ├── rest_client.py                     ← REST API client with retry
+    ├── reporting.py                       ← Delta tracking & URL generation
+    ├── config.py                          ← Configuration helpers
+    ├── clients.py                         ← Client wrappers
+    ├── discovery.py                       ← Source discovery logic
+    ├── migrate.py                         ← Migration orchestration
+    └── utils.py                           ← Logging, chunking, temp dirs
 ```
 
 ---
 
-## Prerequisites
+## ✅ Prerequisites
 
-### 1. Network Connectivity
+### 1. 🌐 Network
 
-- Target workspace must reach the source workspace REST API (port 443).
-- If using Private Link / VNet: ensure NSG/firewall rules allow HTTPS egress.
-- Cross-region: verify VNet peering or public egress is available.
+- Target workspace must reach the source workspace REST API (port **443**).
+- Private Link / VNet? → Ensure NSG/firewall allows HTTPS egress.
+- Cross-region? → Verify VNet peering or public egress.
 
-### 2. Authentication (choose one)
+### 2. 🔑 Authentication (pick one)
 
-| Method | Required Values |
+| Method | What You Need |
 | --- | --- |
-| **PAT** | Source workspace URL + Personal Access Token |
+| **PAT** (simplest) | Source workspace URL + [Personal Access Token](https://docs.databricks.com/en/dev-tools/auth/pat.html) |
 | **Service Principal** | Source workspace URL + `client_id` + `client_secret` |
 
-> **Recommendation**: Store credentials in a Databricks secret scope.
+> 🔒 **Best practice:** Store credentials in a [Databricks secret scope](https://docs.databricks.com/en/security/secrets/secret-scopes.html) — never hardcode tokens!
 
-### 3. Permissions
+### 3. 🛡️ Permissions
 
-**On source workspace:**
-- Read MLflow Tracking (experiments, runs)
-- Read Model Registry (models, versions)
-- Download artifacts
+| Where | What |
+| --- | --- |
+| **Source workspace** | Read: MLflow Tracking (experiments, runs) + Model Registry (models, versions) + Download artifacts |
+| **Target workspace** | Write: `/Shared` experiments + Create registered models & versions |
+| **UC targets** | `USE CATALOG`, `USE SCHEMA`, `CREATE MODEL` on the target catalog/schema |
 
-**On target workspace (current):**
-- Write to `/Shared` experiments
-- Create registered models and versions
+### 4. 💻 Compute
 
-### 4. Compute
-
-- Serverless (CPU) or any cluster with `mlflow` and `databricks-sdk` available.
-- No GPU required.
+- ✅ **Serverless CPU** — works great, no special setup
+- ✅ Any cluster with `mlflow` + `databricks-sdk` pre-installed
+- ❌ No GPU needed
 
 ---
 
-## Execution Flow
+## 🏁 Step-by-Step: How to Run
 
-The framework operates in two phases: **Discover** (builds inventory) and **Migrate** (processes PENDING models from tracking table).
+The notebook has **3 cells**: Markdown header → Configuration → Run Migration.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Cell 1-2: Documentation (no execution needed)                  │
-├─────────────────────────────────────────────────────────────────┤
-│  Cell 3: Setup Imports                                          │
-│  • Adds project to sys.path, force-reloads framework            │
-├─────────────────────────────────────────────────────────────────┤
-│  Cell 4: Source Workspace Credentials                           │
-│  • AUTH_MODE = "pat" or "service_principal"                      │
-│  • SOURCE_HOST, TOKEN or SP_CLIENT_ID/SECRET                    │
-├─────────────────────────────────────────────────────────────────┤
-│  Cell 5: Migration Options + Tracking Table Config              │
-│  • TRACKING_TABLE = catalog.schema.table                        │
-│  • Prefixes, batch_size, max_workers, allowlists                │
-├─────────────────────────────────────────────────────────────────┤
-│  Cell 6: Discover Source Assets (Phase 1)                       │
-│  • Discovers ALL models from source (parallelized)              │
-│  • Generates inventory report (parallel, 20 workers)            │
-│  • MERGEs to Delta tracking table (all start as PENDING)        │
-│  • include_metadata=True/False controls artifact downloads      │
-├─────────────────────────────────────────────────────────────────┤
-│  Cell 7: Run Bulk Migration (Phase 2)                           │
-│  • migrate_pending(): reads PENDING from tracking table         │
-│  • Targeted discovery — only for pending models                 │
-│  • Updates tracking table per-model (COMPLETED/PARTIAL/FAILED)  │
-│  • Populates target_model_url + target_experiment_urls           │
-├─────────────────────────────────────────────────────────────────┤
-│  Cell 8: Migration Report                                       │
-│  • Displays tracking table grouped by status                    │
-│  • Shows: COMPLETED, PARTIAL, PENDING, FAILED counts            │
-└─────────────────────────────────────────────────────────────────┘
+### Step 1️⃣ — Open the Notebook
+
+Open **`Workspace Registry Migration`** in your target workspace.
+
+### Step 2️⃣ — Configure (Cell 2)
+
+Edit the **Configuration** cell. Here's what to set for each scenario:
+
+#### 🔀 Scenario A: Workspace → Workspace
+
+```python
+SOURCE_REGISTRY  = "workspace"
+TARGET_REGISTRY  = "workspace"
+SOURCE_HOST      = "https://<source-workspace>.azuredatabricks.net"
+SOURCE_TOKEN     = dbutils.secrets.get("my-scope", "source-pat")
+MODEL_NAMES      = ["my_model_1", "my_model_2"]   # [] = all models
+MODEL_NAME_PREFIX = "migrated_"                     # avoid name collision
+TRACKING_TABLE   = "catalog.schema.ws_tracking"     # Delta tracking table
 ```
 
-### Resume Behavior
+#### ⬆️ Scenario B: Workspace → Unity Catalog
 
-Re-running **cell 7** after a partial migration only processes models still in `PENDING` state.
-Already-completed models are skipped entirely — no re-discovery, no redundant API calls.
-For 900 models where 700 are done, it only touches the remaining 200.
+```python
+SOURCE_REGISTRY  = "workspace"
+TARGET_REGISTRY  = "uc"
+SOURCE_HOST      = "https://<source-workspace>.azuredatabricks.net"
+SOURCE_TOKEN     = dbutils.secrets.get("my-scope", "source-pat")
+MODEL_NAMES      = ["my_model_1", "my_model_2"]
+UC_TARGET_CATALOG = "my_catalog"
+UC_TARGET_SCHEMA  = "my_schema"
+TRACKING_TABLE    = "my_catalog.my_schema.migration_tracking"
+```
+
+#### 🔄 Scenario C: UC → UC (cross-catalog/schema)
+
+```python
+SOURCE_REGISTRY  = "uc"
+TARGET_REGISTRY  = "uc"
+# For same-workspace UC→UC, auto-detect credentials:
+_ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+SOURCE_HOST      = "https://" + _ctx.browserHostName().get()
+SOURCE_TOKEN     = _ctx.apiToken().get()
+MODEL_NAMES      = ["source_catalog.source_schema.my_model"]
+UC_TARGET_CATALOG = "target_catalog"
+UC_TARGET_SCHEMA  = "target_schema"
+TRACKING_TABLE    = "target_catalog.target_schema.migration_tracking"
+```
+
+#### ⬇️ Scenario D: UC → Workspace
+
+```python
+SOURCE_REGISTRY  = "uc"
+TARGET_REGISTRY  = "workspace"
+SOURCE_HOST      = "https://<source-workspace>.azuredatabricks.net"
+SOURCE_TOKEN     = dbutils.secrets.get("my-scope", "source-pat")
+MODEL_NAMES      = ["catalog.schema.my_uc_model"]
+MODEL_NAME_PREFIX = "from_uc_"    # target WS model name prefix
+TRACKING_TABLE    = "catalog.schema.uc_ws_tracking"
+```
+
+### Step 3️⃣ — Run All
+
+Hit **Run All** (or run cells 2 → 3 in order). The framework will:
+
+```
+📡 Phase 1 — Discovery
+   └─ Scan source → list models, versions, experiments, runs
+   └─ MERGE inventory into tracking table (all start as PENDING)
+
+🚚 Phase 2 — Migration
+   └─ Download artifacts from source → local staging
+   └─ Create experiments + clone runs on target
+   └─ Register model versions on target (sequential per model)
+   └─ Update tracking table per model (COMPLETED / PARTIAL / FAILED)
+
+✅ Phase 3 — Verification
+   └─ Compare source vs target version counts
+   └─ Report mismatches
+```
+
+### Step 4️⃣ — Review Results
+
+The output table shows per-model:
+
+| Column | Meaning |
+| --- | --- |
+| **Model** | Source model name |
+| **Model URL** | 🔗 Clickable link to target model |
+| **Versions Migrated** | Count of successfully created versions |
+| **Status** | ✅ OK / ❌ FAILED |
+| **Verified** | ✅ `[N] → [N]` match or ❌ mismatch |
+| **Comments** | Error details (if any) |
+
+### Step 5️⃣ — Resume (if needed)
+
+Just **re-run** the same cells. The framework:
+- ✅ Skips `COMPLETED` models (reads tracking table)
+- ✅ Retries `PENDING` / `FAILED` models
+- ✅ Skips already-created versions (tag-based dedup)
+
+To force-retry failed models:
+```sql
+UPDATE my_catalog.my_schema.migration_tracking
+SET migration_status = 'PENDING'
+WHERE migration_status = 'FAILED'
+```
 
 ---
 
-## Step-by-Step Execution
+## 📤📥 Export / Import Mode (Air-Gapped Migrations)
 
-### Step 1: Configure Credentials (Cell 4)
+When source and target workspaces **cannot reach each other** (air-gapped, different clouds, strict firewall), use the **export → transfer → import** workflow instead of direct migration.
 
-Replace the placeholder values:
+### 🔀 Three Migration Modes
+
+| Mode | Runs On | What It Does |
+| --- | --- | --- |
+| `"direct"` | **Either** (needs access to both) | Standard end-to-end migration (default, unchanged behavior) |
+| `"export"` | **Source** workspace | Discovers models → downloads artifacts → writes JSON manifests to `ARTIFACT_TEMP_DIR`. No target operations. |
+| `"import"` | **Target** workspace | Reads manifests + artifacts from `ARTIFACT_TEMP_DIR` → creates experiments, runs, models & versions on target. No source API calls. |
+
+### 🛫 Step-by-Step: Export / Import Workflow
+
+#### Step 1️⃣ — Export from Source
+
+On the **source** workspace, set:
 
 ```python
-AUTH_MODE = "pat"  # or "service_principal"
-SOURCE_HOST = "https://<source-workspace>.azuredatabricks.net"
-SOURCE_TOKEN = dbutils.secrets.get("migration-scope", "source-token")
+MIGRATION_MODE    = "export"
+ARTIFACT_TEMP_DIR = "/tmp/ws_export_bundle"   # or /Volumes/..., /dbfs/tmp/...
+# Configure SOURCE_HOST, SOURCE_TOKEN, MODEL_NAMES as usual
+# TARGET settings are ignored in export mode
 ```
 
-For service principal:
+Run the notebook. The framework will:
+```
+📡 Phase 1 — Discovery
+   └─ Scan source models, versions, experiments, runs
+
+📦 Phase 2 — Export
+   └─ Download all model artifacts to ARTIFACT_TEMP_DIR/artifacts/
+   └─ Write JSON manifests (models, versions, experiments, runs)
+   └─ ⏭️  Skip all target operations
+   └─ Update tracking table with EXPORTED status
+```
+
+#### Step 2️⃣ — Transfer the Bundle
+
+Copy the `ARTIFACT_TEMP_DIR` contents to the target workspace using any method:
+
+```bash
+# Azure Blob → Azure Blob
+azcopy copy "/tmp/ws_export_bundle/*" \
+  "https://<target-storage>.blob.core.windows.net/export-bundle/" --recursive
+
+# Upload to Unity Catalog Volume
+databricks fs cp -r /tmp/ws_export_bundle \
+  dbfs:/Volumes/catalog/schema/volume/export-bundle/
+
+# Or: zip + scp, S3 sync, GCS transfer, etc.
+```
+
+#### Step 3️⃣ — Import on Target
+
+On the **target** workspace, set:
+
 ```python
-AUTH_MODE = "service_principal"
-SOURCE_HOST = "https://<source-workspace>.azuredatabricks.net"
-SP_CLIENT_ID = dbutils.secrets.get("migration-scope", "sp-client-id")
-SP_CLIENT_SECRET = dbutils.secrets.get("migration-scope", "sp-client-secret")
+MIGRATION_MODE    = "import"
+ARTIFACT_TEMP_DIR = "/tmp/ws_export_bundle"   # same path (or wherever you placed the bundle)
+# Configure target settings:
+#   UC targets → UC_TARGET_CATALOG + UC_TARGET_SCHEMA
+#   WS targets → MODEL_NAME_PREFIX
+# SOURCE_HOST / SOURCE_TOKEN are ignored in import mode
 ```
 
-### Step 2: Set Migration Options (Cell 5)
+Run the notebook. The framework will:
+```
+📥 Phase 1 — Load Manifests
+   └─ Read models, versions, experiments, runs from JSON manifests
+
+🚚 Phase 2 — Import
+   └─ Create experiments + clone runs from manifest data
+   └─ Upload artifacts from bundle directory
+   └─ Register model versions on target
+
+✅ Phase 3 — Verification
+   └─ Compare manifest counts vs target counts
+```
+
+### 📁 Export Bundle Structure
+
+```
+ARTIFACT_TEMP_DIR/
+├── manifests/
+│   ├── models.json          ← Model metadata (name, description, tags)
+│   ├── versions.json        ← Version details (stage, tags, run mapping)
+│   ├── experiments.json     ← Experiment names + tags
+│   └── runs.json            ← Run params, full metric history, tags, status
+└── artifacts/
+    └── <model_name>/
+        └── v<version>/
+            └── model/       ← MLmodel, pkl, conda.yaml, requirements.txt…
+```
+
+### 🔄 Export / Import Examples
+
+#### UC → UC (air-gapped)
+
+```python
+# --- On SOURCE workspace ---
+MIGRATION_MODE   = "export"
+SOURCE_REGISTRY  = "uc"
+TARGET_REGISTRY  = "uc"
+MODEL_NAMES      = ["prod_catalog.ml.fraud_detector"]
+ARTIFACT_TEMP_DIR = "/Volumes/prod_catalog/staging/export_bundle"
+```
+
+```python
+# --- On TARGET workspace ---
+MIGRATION_MODE   = "import"
+SOURCE_REGISTRY  = "uc"
+TARGET_REGISTRY  = "uc"
+UC_TARGET_CATALOG = "new_catalog"
+UC_TARGET_SCHEMA  = "ml"
+ARTIFACT_TEMP_DIR = "/Volumes/new_catalog/staging/export_bundle"
+```
+
+#### WS → WS (cross-workspace)
+
+```python
+# --- On SOURCE workspace ---
+MIGRATION_MODE   = "export"
+SOURCE_REGISTRY  = "workspace"
+TARGET_REGISTRY  = "workspace"
+MODEL_NAMES      = ["my_model_1", "my_model_2"]
+ARTIFACT_TEMP_DIR = "/tmp/ws_export_bundle"
+```
+
+```python
+# --- On TARGET workspace ---
+MIGRATION_MODE    = "import"
+SOURCE_REGISTRY   = "workspace"
+TARGET_REGISTRY   = "workspace"
+MODEL_NAME_PREFIX = "imported_"
+ARTIFACT_TEMP_DIR = "/tmp/ws_export_bundle"
+```
+
+### 💡 Export / Import Tips
+
+- 🧪 **Test with 1 model first** — verify the full export → transfer → import cycle before bulk runs
+- 📊 **Tracking table works in both modes** — export writes `EXPORTED` status; import writes `COMPLETED`
+- 🔄 **Resumable** — re-running import skips already-imported models (same dedup logic as direct mode)
+- 💾 **Bundle is portable** — any path both workspaces can access works (`/Volumes/...`, `/dbfs/...`, `/tmp/...`)
+- ⚡ **Fastest transfer** — use `/Volumes/` on both sides with cloud-native copy (`azcopy`, `gsutil`, `aws s3 sync`)
+- 🗂️ **Manifest = source of truth** — the JSON manifests capture the exact source state at export time
+- ⚠️ **Don't mix modes** — run export completely before starting import; don't run both on the same workspace simultaneously
+
+---
+
+## 📤📥 Export / Import Mode (Air-Gapped Migrations)
+
+When source and target workspaces **cannot reach each other** (air-gapped, different clouds, strict firewall), use the **export → transfer → import** workflow instead of direct migration.
+
+### How It Works
+
+| Mode | Runs On | What It Does |
+| --- | --- | --- |
+| `"direct"` | **Either** (needs both) | Standard end-to-end migration (default, unchanged behavior) |
+| `"export"` | **Source** workspace | Discovers models → downloads artifacts → writes JSON manifests to `ARTIFACT_TEMP_DIR`. No target operations. |
+| `"import"` | **Target** workspace | Reads manifests + artifacts from `ARTIFACT_TEMP_DIR` → creates experiments, runs, models & versions on target. No source API calls. |
+
+### Step-by-Step: Export / Import Workflow
+
+#### Step 1️⃣ — Export from Source
+
+On the **source** workspace, set:
+
+```python
+MIGRATION_MODE    = "export"
+ARTIFACT_TEMP_DIR = "/tmp/ws_export_bundle"   # or /Volumes/..., /dbfs/tmp/...
+# Configure SOURCE_HOST, SOURCE_TOKEN, MODEL_NAMES as usual
+# TARGET settings are ignored in export mode
+```
+
+Run the notebook. The framework will:
+```
+📡 Phase 1 — Discovery
+   └─ Scan source models, versions, experiments, runs
+
+📦 Phase 2 — Export
+   └─ Download all artifacts to ARTIFACT_TEMP_DIR/artifacts/
+   └─ Write JSON manifests to ARTIFACT_TEMP_DIR/manifests/
+   └─ ⏭️  Skip all target operations
+```
+
+#### Step 2️⃣ — Transfer the Bundle
+
+Copy the `ARTIFACT_TEMP_DIR` contents to the target workspace using any method:
+
+```bash
+# Azure Blob → Azure Blob
+azcopy copy "/tmp/ws_export_bundle/*" \
+  "https://<target-storage>.blob.core.windows.net/export-bundle/" --recursive
+
+# Upload to Unity Catalog Volume
+databricks fs cp -r /tmp/ws_export_bundle \
+  dbfs:/Volumes/catalog/schema/volume/export-bundle/
+
+# Or: zip + scp, S3 sync, GCS transfer, etc.
+```
+
+#### Step 3️⃣ — Import on Target
+
+On the **target** workspace, set:
+
+```python
+MIGRATION_MODE    = "import"
+ARTIFACT_TEMP_DIR = "/tmp/ws_export_bundle"   # same path (or wherever you placed the bundle)
+# Configure target settings (UC_TARGET_CATALOG, UC_TARGET_SCHEMA, MODEL_NAME_PREFIX, etc.)
+# SOURCE_HOST / SOURCE_TOKEN are ignored in import mode
+```
+
+Run the notebook. The framework will:
+```
+📥 Phase 1 — Load Manifests
+   └─ Read JSON manifests from ARTIFACT_TEMP_DIR/manifests/
+
+🚚 Phase 2 — Import
+   └─ Create experiments + clone runs from manifest data
+   └─ Upload artifacts from bundle directory
+   └─ Register model versions on target
+
+✅ Phase 3 — Verification
+   └─ Compare manifest counts vs target counts
+```
+
+### 📁 Export Bundle Structure
+
+```
+ARTIFACT_TEMP_DIR/
+├── manifests/
+│   ├── models.json          ← Model metadata (name, description, tags)
+│   ├── versions.json        ← Version details (stage, tags, run mapping)
+│   ├── experiments.json     ← Experiment names + tags
+│   └── runs.json            ← Run params, metrics, tags, status
+└── artifacts/
+    └── <model_name>/
+        └── <version>/
+            └── model/       ← MLmodel, pkl, conda.yaml, etc.
+```
+
+### 💡 Export / Import Tips
+
+- 🧪 **Test with 1 model first** — verify the full export → transfer → import cycle before bulk runs
+- 📊 **Tracking table works in both modes** — export writes `EXPORTED` status; import writes `COMPLETED`
+- 🔄 **Resumable** — re-running import skips already-imported models (same dedup logic as direct)
+- 💾 **Bundle is portable** — any path both workspaces can access works (`/Volumes/...`, `/dbfs/...`, `/tmp/...`)
+- ⚡ **Fastest transfer** — use `/Volumes/` on both sides with cloud-native copy (azcopy, gsutil, aws s3 sync)
+
+---
+
+## ⚙️ Configuration Reference
 
 | Option | Purpose | Default |
 | --- | --- | --- |
-| `model_name_prefix` | Prefix for target model names (avoids collisions) | `""` |
-| `experiment_name_prefix` | Prefix for target experiment names | `""` |
-| `extra_model_names` | Allowlist of model names to migrate (`[]` = all) | `[]` |
-| `max_model_versions_per_model` | Max versions per model (`None` = all) | `None` |
-| `max_runs_per_experiment` | Max runs per experiment (`None` = all, fully paginated) | `None` |
-| `skip_existing_model_versions` | Skip versions already in target (by tag match) | `True` |
-| `download_artifacts` | Controls non-model artifact transfer (see below) | `True` |
-| `include_run_artifacts` | Whether to invoke artifact copy at all | `True` |
-| `include_deleted_runs` | Include soft-deleted runs | `True` |
-| `batch_size` | Models/experiments per parallel batch | `20` |
-| `max_workers` | Thread pool concurrency | `20` |
-
-### Step 3: Run Discovery (Cell 6)
-
-Run cell 6 to preview what will be migrated **without making changes**.
-
-Expected output:
-```python
-{'registered_models': 15, 'experiments': 8, 'runs': 120, 'model_versions': 25}
-```
-
-### Step 4: Execute Migration (Cell 7)
-
-Run cell 7. Expected output:
-```python
-{'migrated_models': 15,
- 'migrated_model_versions': 22,
- 'migrated_experiments': 8,
- 'migrated_runs': 22,
- 'skipped_versions': [
-   {'model': 'some_model', 'version': '3', 'reason': 'No model artifacts...'}
- ]}
-```
-
-### Step 5: Review Report (Cell 8)
-
-Run cell 8 for a detailed DataFrame report:
-
-```
-MIGRATION REPORT: 22/25 versions migrated successfully
-  ✅ Migrated: 22  |  ⚠️ Failed: 0  |  ❌ Run deleted: 2  |  ❌ No artifacts: 1
-```
-
-The DataFrame shows per-version:
-- Source vs target params/metrics/artifacts counts
-- Whether each dimension matches exactly
-- Clear status for non-migratable versions
+| `MODEL_NAMES` | Specific models to migrate (`[]` = scan all) | `[]` |
+| `MODEL_NAME_PREFIX` | Prefix for WS target names (avoids collisions) | `""` |
+| `UC_TARGET_CATALOG` | Override target catalog for UC targets | `""` (mirror source) |
+| `UC_TARGET_SCHEMA` | Override target schema for UC targets | `""` (mirror source) |
+| `TRACKING_TABLE` | Delta table for progress tracking | `""` |
+| `INCLUDE_ARTIFACTS` | Copy model artifacts | `True` |
+| `CREATE_DUMMY_VERSIONS` | Placeholder versions for deleted source runs | `True` |
+| `INCLUDE_DELETED` | Include soft-deleted runs | `False` |
+| `BATCH_SIZE` | Models per parallel batch | `10` |
+| `INCLUDE_CATALOGS` | Only scan these catalogs (bulk UC scan) | `[]` (all) |
+| `EXCLUDE_CATALOGS` | Skip these catalogs | `[]` |
+| `EXCLUDE_SCHEMAS` | Skip these schemas (`catalog.schema`) | `[]` |
+| `MIGRATION_MODE` | `"direct"` / `"export"` / `"import"` | `"direct"` |
+| `ARTIFACT_TEMP_DIR` | Staging dir for artifacts & export bundles | `"/tmp/ws_export_bundle"` |
+| `MIGRATION_MODE` | `"direct"` / `"export"` / `"import"` | `"direct"` |
+| `ARTIFACT_TEMP_DIR` | Staging dir for artifacts & export bundles | `"/tmp/ws_export_bundle"` |
 
 ---
 
-## Artifact Download Behavior
+## 📊 Tracking Table
 
-Two flags control what gets copied. Understanding the interaction is important for large migrations.
+The Delta tracking table is your migration's single source of truth.
 
-### How the flags interact
+**Primary key:** `(source_host, model_name)` — safe for multi-workspace migrations.
 
-| `download_artifacts` | `include_run_artifacts` | Effect |
+| Column | Set By | Description |
 | --- | --- | --- |
-| `True` | `True` | **Full clone** — model files + all other run artifacts (plots, SHAP values, data samples, evaluation CSVs, etc.) |
-| `True` | `False` | Model files only (minimum for version registration) |
-| `False` | `True` or `False` | Model files still copied (required for `create_model_version`), but non-model artifacts are skipped |
+| `source_host` | Discovery | Source workspace URL |
+| `model_name` | Discovery | Source model name |
+| `readiness` | Discovery | `READY` / `PARTIAL` / `BLOCKED` |
+| `migration_status` | Both | `PENDING` → `COMPLETED` / `PARTIAL` / `FAILED` |
+| `source_versions` | Discovery | Total version count |
+| `target_versions` | Migration | Migrated version count |
+| `target_runs` | Migration | Cloned run count |
+| `target_model_url` | Migration | 🔗 Link to target model |
+| `target_experiment_urls` | Migration | 🔗 Links to target experiments |
+| `migration_comments` | Migration | Error details |
+| `last_updated_at` | Both | Timestamp of last change |
 
-### What "model files" means
-
-These are the files under the `model/` subdirectory of a run's artifact store — the minimum set required to register a model version:
-
+**Status flow:**
 ```
-artifacts/
-└── model/
-    ├── MLmodel              ← Model metadata (flavors, signature)
-    ├── python_model.pkl     ← Serialized model object
-    ├── conda.yaml           ← Conda environment spec
-    ├── python_env.yaml      ← Python environment spec
-    └── requirements.txt     ← Pip dependencies
+PENDING → IN_PROGRESS → COMPLETED ✅
+                      → PARTIAL   ⚠️  (some versions migrated)
+                      → FAILED    ❌  (zero versions, errors occurred)
 ```
-
-These are **always copied** regardless of either flag, because `create_model_version` requires them to exist at the target path.
-
-### What "non-model artifacts" means
-
-Everything else under `artifacts/` that is NOT the model directory:
-
-```
-artifacts/
-├── model/                   ← Always copied (see above)
-├── feature_importance.png   ← Only copied if both flags are True
-├── confusion_matrix.png     ← Only copied if both flags are True
-├── shap_summary.html        ← Only copied if both flags are True
-└── eval_results.csv         ← Only copied if both flags are True
-```
-
-### When to set `download_artifacts=False`
-
-- **Large-scale migrations** (100+ models) where you only need working model versions in the target registry
-- **Storage-sensitive environments** — non-model artifacts can be GBs per run (data snapshots, large plots)
-- **Speed** — skipping non-model artifacts significantly reduces migration time
-
-### When to keep `download_artifacts=True`
-
-- You need a **complete replica** of the source workspace (audit, compliance)
-- Downstream notebooks reference non-model artifacts (e.g., loading evaluation CSVs from runs)
-- Experiment comparison workflows depend on logged plots/tables
 
 ---
 
-## Concurrency Model
+## 🔧 Troubleshooting
 
-The framework uses **parallel execution** at multiple levels:
-
-```
-migrate_pending()
-├── Query tracking table for PENDING models
-├── _discover_models(pending_names)         ← targeted discovery
-│   ├── ThreadPoolExecutor: fetch versions    ← parallel per model
-│   └── ThreadPoolExecutor: fetch runs        ← parallel per experiment
-├── _migrate_experiments()
-│   └── for batch in chunked(experiments, batch_size):   ← batched
-│       └── ThreadPoolExecutor(max_workers)              ← parallel
-└── _migrate_models()
-    └── for batch in chunked(models, batch_size):        ← batched
-        └── ThreadPoolExecutor(max_workers)              ← parallel
-            └── _migrate_single_registered_model(model)
-        └── _update_tracking_table()                     ← main thread (Spark-safe)
-
-generate_inventory_report()
-└── ThreadPoolExecutor(max_workers=20)                  ← parallel per model
-    └── _process_single_model(model)
-        └── search_model_versions + get_run per version
-        └── _parse_model_metadata (if include_metadata=True)
-```
-
-**Important**: Delta tracking table updates (`spark.sql(UPDATE ...)`) run on the **main thread** after each model’s future completes — Spark SQL is NOT thread-safe on serverless.
-
-**Tuning guidance:**
-- `max_workers=20` — good default for serverless (no cluster to saturate)
-- `max_workers=6-8` — use if hitting 429 rate limits on source workspace
-- `batch_size=20` — controls memory; larger batches hold more futures
-
----
-
-## Edge Cases Handled
-
-| Scenario | Behavior |
-| --- | --- |
-| Source run deleted | Reported in `discovery_comments`; version counted as blocked |
-| Version with `run_id=None` | Counted as migratable (artifact-only registration) |
-| Model artifacts purged | Caught before `create_model_version`; reported in `migration_comments` |
-| Artifact with empty path | Skipped individually; other artifacts still copied |
-| Rate limiting (429) | Automatic retry with exponential backoff (5 attempts) |
-| Duplicate model version | Skipped when `skip_existing_model_versions=True` (tag-based) |
-| Trailing whitespace in model names | Auto-stripped during allowlist matching |
-| Thread-safety (env vars) | Global lock prevents source/target credential pollution |
-| Thread-safety (Spark SQL) | Tracking updates run on main thread after future.result() |
-| Transient server errors (500/503) | Retried automatically |
-| Same-workspace test | Target counts only include tagged versions (excludes originals) |
-| Cross-workspace env leak | `try/finally` in reporting guarantees env restoration |
-
----
-
-## Delta Tracking Table
-
-The migration state is persisted in a Unity Catalog Delta table (configured via `TRACKING_TABLE` in cell 5).
-
-**Primary key**: `(source_host, model_name)` — multi-workspace safe.
-
-### Key Columns
-
-| Column | Populated by | Notes |
-| --- | --- | --- |
-| `source_host` | Discovery | Part of PK |
-| `model_name` | Discovery | Part of PK |
-| `readiness` | Discovery | ✅ READY / ⚠️ PARTIAL / ❌ BLOCKED |
-| `source_versions` | Discovery | Total versions in source |
-| `source_versions_migratable` | Discovery | Versions with accessible runs |
-| `source_params` / `metrics` / `artifacts` | Discovery | Aggregate counts from source |
-| `target_versions` | Migration | Versions with `source_model_version` tag in target |
-| `target_params` / `metrics` / `artifacts` | Migration | Counts from migrated versions only |
-| `migration_status` | Both | PENDING → COMPLETED / PARTIAL / FAILED / SKIPPED |
-| `target_model_url` | Migration | Clickable URL to target model |
-| `target_experiment_urls` | Migration | Pipe-separated experiment URLs |
-| `discovery_comments` | Discovery | Per-version error messages |
-| `migration_comments` | Migration | Per-version failure reasons |
-
-### MERGE Behavior
-
-- **Discovery** (cell 6): `WHEN MATCHED` updates only source-side columns. Never overwrites target-side data.
-- **Migration** (cell 7): `UPDATE` only writes to target-side columns + `migration_status`.
-- **Safe to re-run discovery** without losing migration progress.
-
-### Migration Status Logic
-
-| Status | Condition |
-| --- | --- |
-| `COMPLETED` | Target tagged versions ≥ source migratable versions |
-| `PARTIAL` | Some versions migrated but not all |
-| `FAILED` | Zero versions migrated + errors encountered |
-| `SKIPPED` | Zero versions migrated, no errors (nothing to do) |
-
----
-
-## Re-running After Failures
-
-The framework is **idempotent** at multiple levels:
-
-1. **Tracking table**: `migrate_pending()` only processes `PENDING` models — skips COMPLETED/PARTIAL/FAILED entirely.
-2. **Version dedup**: `skip_existing_model_versions=True` checks for `source_model_version` tag in target.
-3. **Run dedup**: Existing target runs detected by `source_run_id` tag — not re-created.
-4. **Reset to retry failures**: `UPDATE tracking_table SET migration_status = 'PENDING' WHERE migration_status = 'FAILED'`
-
----
-
-## Troubleshooting
+### 🚨 Common Errors
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `0 models discovered` | `extra_model_names` doesn't match source names | Check for typos/whitespace; set `[]` for all models |
-| `⚠️ No models discovered` | Credentials not configured or empty | Fill in SOURCE_HOST + credentials in cell 4 |
-| `KeyError: 'readiness'` | Empty inventory DataFrame (0 models) | Fixed: `print_inventory_summary` now handles empty DFs |
-| All models show `❌ BLOCKED` | `generate_inventory_report` was using wrong client | Fixed: pass `source_context=migrator.source` |
-| `source_runs = 1000` for all models | Pagination cap in `search_runs` | Fixed: now paginates fully (set `max_runs_per_experiment` to cap) |
-| `expected string or bytes-like object, got NoneType` | Model version has `run_id=None` | Fixed: versions without runs counted as ready |
-| `INVALID_PARAMETER_VALUE: Got an invalid source` | Old framework in memory | Re-run cell 3 to reload framework |
-| `RESOURCE_DOES_NOT_EXIST` | Source run was permanently deleted | Reported in `discovery_comments`; version blocked |
-| Migration hangs | Rate limiting on source workspace | Reduce `max_workers` to 6-8 |
-| Duplicate version error | Version already exists in target | Set `skip_existing_model_versions=True` |
-| Tracking table not updating | Spark SQL called from worker thread | Fixed: updates run on main thread after `future.result()` |
-| Target counts > source counts | Same-workspace test (versions accumulate) | Expected; real cross-workspace migration won't have this |
+| `ValueError: Provide either a PAT token or a service principal` | Empty `SOURCE_HOST` / `SOURCE_TOKEN` | ✏️ Fill in credentials in the Configuration cell |
+| `0 models discovered` | `MODEL_NAMES` doesn't match source | 🔍 Check for typos/whitespace; use `[]` for all models |
+| `RESOURCE_DOES_NOT_EXIST` | Source run was permanently deleted | ✅ Expected — framework creates placeholder if `CREATE_DUMMY_VERSIONS=True` |
+| `INVALID_PARAMETER_VALUE: Got an invalid source` | Stale framework in memory | 🔄 Re-run Cell 3 (force-reloads all modules) |
+| `404 Client Error: Not Found for url: .../runs/get` | Source run deleted after version was created | ✅ Placeholder version created automatically |
+| `Failed to download artifacts from path 'model'` | Model artifacts purged from source | ✅ Version created as placeholder; noted in Comments |
+| `expected string or bytes-like object, got NoneType` | Model version has `run_id=None` | ✅ Fixed — versions without runs counted as ready |
+
+### 🐌 Performance Issues
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Migration hangs / very slow | Rate limiting (HTTP 429) on source | ⬇️ Reduce `BATCH_SIZE` to `5` — auto-retry handles 429s |
+| `Rate limited on uc_search_model_versions` | UC API rate limits (stricter than WS) | ✅ Normal — framework auto-retries with backoff (up to 5 attempts) |
+| Takes hours for large migrations | Too many artifacts per run | ⚡ Set `INCLUDE_ARTIFACTS=False` for model-files-only (much faster) |
+| `source_runs = 1000` for all models | Pagination cap in `search_runs` | ✅ Fixed — now paginates fully |
+
+### 📊 Tracking Table Issues
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Tracking table not created | Missing catalog/schema permissions | 🔐 Ensure `CREATE TABLE` permission on the target schema |
+| Status stuck at `PENDING` | Migration failed before status update | 👀 Check Comments column; fix the error and re-run |
+| All models re-migrating on re-run | `TRACKING_TABLE` not set | ✏️ Set a tracking table path to enable resume |
+| Tracking table not updating from threads | Spark SQL called from worker thread | ✅ Fixed — updates run on main thread after `future.result()` |
+| `'function' object has no attribute 'get'` | UC SDK bug — `ModelVersionSearch.tags` is a method, not a dict | ✅ **Fixed in v2** — uses `get_model_version` per version |
+| `'function' object has no attribute 'items'` | Same UC SDK bug in tracking table update | ✅ **Fixed in v2** — same approach |
+
+### ✅ Verification Mismatches
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `[N] → [2N] mismatch` | Re-ran migration without cleaning target | 🧹 Clean target models or ensure dedup is on |
+| `[4] → [6] mismatch` | Source has non-READY versions; target has all READY | ✅ Expected when `CREATE_DUMMY_VERSIONS=True` — placeholders are READY |
+| Target counts > source | Same-workspace test accumulates versions | ✅ Expected — real cross-workspace won't have this |
+
+### 🔐 Permission Errors
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `PERMISSION_DENIED` on source | PAT/SP lacks MLflow read access | 🛡️ Grant `Can Read` on source experiments + models |
+| `PERMISSION_DENIED` on target | Can't create models/experiments | 🛡️ Grant `Can Manage` on target model registry |
+| `PERMISSION_DENIED` on UC target | Missing UC privileges | 🛡️ Grant `USE CATALOG`, `USE SCHEMA`, `CREATE MODEL` |
+| `KeyError: 'readiness'` | Empty inventory DataFrame (0 models) | ✅ Fixed — `print_inventory_summary` now handles empty DFs |
+| All models show `❌ BLOCKED` | Wrong client used for inventory | ✅ Fixed — pass `source_context=migrator.source` |
+
+---
+
+## 🔁 Concurrency Model
+
+```
+execute_migration()
+├── 📡 discover()                               ← Phase 1
+│   ├── ThreadPool: fetch model versions           (parallel per model)
+│   ├── ThreadPool: fetch experiment runs           (parallel per experiment)
+│   └── MERGE into tracking table                   (main thread, Spark-safe)
+├── 🚚 _migrate_experiments()                    ← Phase 2a
+│   └── batched ThreadPool                          (parallel per experiment)
+├── 🚚 _migrate_models()                        ← Phase 2b
+│   └── for batch in chunked(models, batch_size):
+│       ├── Phase 1: ThreadPool download artifacts   (high concurrency)
+│       └── Phase 2: ThreadPool register versions    (sequential per model)
+│           └── UPDATE tracking table                (main thread after each model)
+└── ✅ Verification                              ← Phase 3
+    └── Compare source vs target version counts
+```
+
+> ⚠️ **Thread safety:** Delta tracking updates (`spark.sql`) always run on the **main thread** — Spark SQL is NOT thread-safe on serverless.
+
+> 📤 **Export mode** runs only Phases 1–2a (discovery + artifact download + manifest write) — no target operations.
+> 📥 **Import mode** skips Phase 1 discovery and reads from manifests instead — no source API calls.
+>
+> 📤 **Export mode** runs only discovery + artifact download + manifest write — no target operations.
+>
+> 📥 **Import mode** skips source discovery and reads from manifests instead — no source API calls.
+
+**Tuning tips:**
+- `BATCH_SIZE=10` — good default for serverless
+- Hitting 429s? → Reduce to `5`
+- Large workspace (1000+ models)? → Keep at `10`, the framework handles batching
+
+---
+
+## 💡 Tips & Tricks
+
+- 🧪 **Test first** — run with 1-2 models + a prefix before bulk migration
+- 📊 **Track everything** — always set `TRACKING_TABLE` for production migrations
+- 🔄 **Idempotent by design** — safe to re-run; completed models are skipped
+- 🧹 **Clean up tests** — use the Cleanup cell (Cell 4) to drop test schemas
+- ⏱️ **Speed up large runs** — set `INCLUDE_ARTIFACTS=False` for model-files-only
+- 🔒 **Never hardcode tokens** — use `dbutils.secrets.get()` in production
+- 📤 **Air-gapped?** — use `MIGRATION_MODE="export"` on source, transfer the bundle, then `"import"` on target
+- 📁 **Bundle path** — `ARTIFACT_TEMP_DIR` works with `/Volumes/`, `/dbfs/`, `/tmp/`, or cloud storage
+- 📤 **Air-gapped?** — use `MIGRATION_MODE="export"` on source, transfer the bundle, then `"import"` on target
+- 📁 **Bundle path** — `ARTIFACT_TEMP_DIR` works with `/Volumes/`, `/dbfs/`, `/tmp/`, or cloud storage paths

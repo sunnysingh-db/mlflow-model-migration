@@ -1,7 +1,6 @@
+# DEPRECATED — this module is dead code. All logic lives in framework.py.
+# Safe to delete this file.
 from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass(frozen=True)

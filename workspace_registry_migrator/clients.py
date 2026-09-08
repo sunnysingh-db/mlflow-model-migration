@@ -1,15 +1,6 @@
+# DEPRECATED — this module is dead code. All logic lives in framework.py.
+# Safe to delete this file.
 from __future__ import annotations
-
-import os
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Iterator
-
-import mlflow
-from databricks.sdk import WorkspaceClient
-from mlflow import MlflowClient
-
-from workspace_registry_migrator.config import SourceWorkspaceCredentials
 
 
 @dataclass(frozen=True)
