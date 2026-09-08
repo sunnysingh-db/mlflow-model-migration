@@ -225,7 +225,7 @@ def _execute_import(
                 with open(meta_path) as _f:
                     model_names_list.append(_json.load(_f)["name"])
 
-    prefix = model_name_prefix if target_registry == "workspace" else ""
+    prefix = model_name_prefix
 
     def _target_name_for(source_name: str) -> str:
         if target_registry == "uc":
@@ -233,7 +233,8 @@ def _execute_import(
             if len(parts) >= 3:
                 cat = uc_target_catalog or parts[0]
                 sch = uc_target_schema or parts[1]
-                return f"{cat}.{sch}.{parts[2]}"
+                short = parts[2]
+                return f"{cat}.{sch}.{prefix}{short}" if prefix else f"{cat}.{sch}.{short}"
             return source_name
         return f"{prefix}{source_name}" if prefix else source_name
 
@@ -339,7 +340,7 @@ def execute_migration(
         source_client_id=client_id,
         source_client_secret=client_secret,
         tracking_table=tracking_table,
-        model_name_prefix=model_name_prefix if target_registry == "workspace" else "",
+        model_name_prefix=model_name_prefix,
         extra_model_names=model_names or [],
         extra_experiment_ids=[],
         source_registry=source_registry,
@@ -468,7 +469,7 @@ def execute_migration(
     # 2b: Models (one at a time, live)
     from workspace_registry_migrator import DiscoveryBundle
     import urllib.parse
-    prefix = model_name_prefix if target_registry == "workspace" else ""
+    prefix = model_name_prefix
 
     def _target_name_for(source_name: str) -> str:
         """Compute the target model name accounting for UC catalog/schema remapping."""
@@ -477,7 +478,8 @@ def execute_migration(
             if len(parts) >= 3:
                 cat = uc_target_catalog or parts[0]
                 sch = uc_target_schema or parts[1]
-                return f"{cat}.{sch}.{parts[2]}"
+                short = parts[2]
+                return f"{cat}.{sch}.{prefix}{short}" if prefix else f"{cat}.{sch}.{short}"
             return source_name
         return f"{prefix}{source_name}" if prefix else source_name
 
@@ -689,7 +691,17 @@ def _verify(migrator: Any, model_names: list[str], prefix: str,
     target_rest = DatabricksRestClient(host=target_host, token=target_token)
 
     for name in model_names:
-        target_name = f"{prefix}{name}" if target_registry == "workspace" else name
+        if target_registry == "uc":
+            parts = name.split(".")
+            if len(parts) >= 3:
+                cat = parts[0]
+                sch = parts[1]
+                short = parts[2]
+                target_name = f"{cat}.{sch}.{prefix}{short}" if prefix else name
+            else:
+                target_name = name
+        else:
+            target_name = f"{prefix}{name}" if prefix else name
         try:
             src = (migrator.source_rest.uc_search_all_model_versions(name)
                    if source_registry == "uc"

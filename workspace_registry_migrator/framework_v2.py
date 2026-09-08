@@ -108,8 +108,12 @@ class MigrationOptions:
             raise ValueError("max_workers must be at least 1")
         if self.max_workers > 64:
             raise ValueError("max_workers must be 64 or less")
-        if self.target_registry == "uc" and (not self.uc_target_catalog or not self.uc_target_schema):
-            raise ValueError("uc_target_catalog and uc_target_schema required when target_registry='uc'")
+        if self.target_registry == "uc" and self.source_registry != "uc" and (not self.uc_target_catalog or not self.uc_target_schema):
+            raise ValueError(
+                "uc_target_catalog and uc_target_schema required when "
+                "target_registry='uc' and source is not UC "
+                "(UC→UC can mirror source catalog.schema automatically)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1546,12 +1550,23 @@ class WorkspaceRegistryMigrator:
         target_run_id = run.info.run_id
         self._target_client.set_terminated(target_run_id)
 
-        # Minimal MLmodel file so version can be created
+        # Minimal but valid MLmodel file so UC model version can be created.
+        # UC requires a proper MLmodel YAML with a model signature.
         with tempfile.TemporaryDirectory() as td:
             model_dir = _os.path.join(td, "model")
             _os.makedirs(model_dir)
+            mlmodel_content = (
+                "artifact_path: model\n"
+                "flavors:\n"
+                "  python_function:\n"
+                "    loader_module: mlflow.pyfunc\n"
+                "signature:\n"
+                "  inputs: '[{\"type\": \"string\", \"name\": \"placeholder_input\"}]'\n"
+                "  outputs: '[{\"type\": \"string\", \"name\": \"placeholder_output\"}]'\n"
+                f"# Placeholder — source v{src_ver} run was deleted\n"
+            )
             with open(_os.path.join(model_dir, "MLmodel"), "w") as f:
-                f.write(f"# Placeholder — source v{src_ver} run was deleted\n")
+                f.write(mlmodel_content)
             self.target_uploader.log_artifacts(
                 run_id=target_run_id, local_dir=model_dir, artifact_path="model",
             )
