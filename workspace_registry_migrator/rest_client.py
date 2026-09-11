@@ -1,8 +1,10 @@
 """Thread-safe REST client for Databricks MLflow operations.
 
-Replaces the env-var-based approach (os.environ["DATABRICKS_HOST"]) with
-per-instance credentials carried in requests.Session headers. Each instance
-is fully isolated — no global lock, no env var mutation.
+All source-workspace operations — including artifact downloads — use
+per-instance credentials carried in requests.Session headers.  Artifact
+downloads go through presigned URLs (POST credentials-for-read), so
+no environment variables are ever read or mutated.  Each instance is
+fully isolated — safe for concurrent use from any number of threads.
 """
 
 from __future__ import annotations
@@ -579,10 +581,116 @@ class DatabricksRestClient:
             for f in data.get("files", [])
         ]
 
-    # ---- Artifact download is NOT available via simple REST on Databricks ----
-    # Databricks uses presigned URLs via DatabricksArtifactRepository.
-    # Use SourceArtifactDownloader below for downloads.
-    # list_artifacts() above works fine for metadata.
+    # ---- Artifact Download via Presigned URLs ----
+
+    @_retry_on_rate_limit()
+    def get_artifact_presigned_urls(
+        self, run_id: str, paths: list[str],
+    ) -> list[dict[str, Any]]:
+        """POST /api/2.0/mlflow/artifacts/credentials-for-read
+
+        Returns credential_infos — each entry has ``path``, ``signed_uri``,
+        and ``type`` (e.g. ``GCP_SIGNED_URL``, ``AWS_PRESIGNED_URL``,
+        ``AZURE_SAS_URI``).
+        """
+        data = self._post_json(
+            "/api/2.0/mlflow/artifacts/credentials-for-read",
+            json_body={"run_id": run_id, "path": paths},
+        )
+        return data.get("credential_infos", [])
+
+    def _list_artifact_files_recursive(
+        self, run_id: str, root_path: str,
+    ) -> list[str]:
+        """Recursively enumerate all *file* paths under ``root_path``."""
+        files: list[str] = []
+        stack = [root_path]
+        while stack:
+            current = stack.pop()
+            entries = self.list_artifacts(run_id, path=current)
+            for entry in entries:
+                if not entry.path:
+                    continue
+                if entry.is_dir:
+                    stack.append(entry.path)
+                else:
+                    files.append(entry.path)
+        return files
+
+    def download_artifact_tree(
+        self,
+        run_id: str,
+        artifact_path: str,
+        dst_path: str,
+        *,
+        batch_size: int = 8,
+        max_workers: int = 10,
+    ) -> str:
+        """Download an artifact tree via presigned URLs — fully thread-safe.
+
+        1. Recursively lists all files under *artifact_path*.
+        2. Batches the paths and fetches presigned URLs.
+        3. Downloads each file with a plain ``requests.get()`` (no auth headers).
+        4. Writes to *dst_path* preserving the directory structure.
+
+        No environment variables are read or mutated — safe for concurrent
+        use from any number of threads.
+
+        Returns the local path to the downloaded artifact root.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 1. Enumerate files
+        all_files = self._list_artifact_files_recursive(run_id, artifact_path)
+        if not all_files:
+            # artifact_path may itself be a single file
+            all_files = [artifact_path]
+
+        # 2. Fetch presigned URLs in batches
+        url_map: dict[str, str] = {}  # artifact_path -> signed_uri
+        for i in range(0, len(all_files), batch_size):
+            batch = all_files[i : i + batch_size]
+            cred_infos = self.get_artifact_presigned_urls(run_id, batch)
+            for info in cred_infos:
+                signed_uri = info.get("signed_uri", "")
+                info_path = info.get("path", "")
+                if signed_uri and info_path:
+                    url_map[info_path] = signed_uri
+
+        # 3. Download files in parallel
+        errors: list[str] = []
+
+        def _download_one(artifact_file_path: str, signed_uri: str) -> None:
+            # Compute local destination preserving directory structure
+            local_path = os.path.join(dst_path, artifact_file_path)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            resp = requests.get(signed_uri, stream=True, timeout=300)
+            resp.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_download_one, path, uri): path
+                for path, uri in url_map.items()
+            }
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(f"{path}: {exc}")
+                    logger.warning(f"Presigned download failed for {path}: {exc}")
+
+        if errors and len(errors) == len(url_map):
+            raise RuntimeError(
+                f"All {len(errors)} artifact downloads failed. "
+                f"First error: {errors[0]}"
+            )
+
+        return os.path.join(dst_path, artifact_path)
 
     # ---- Registered Model Tags ----
 
@@ -595,94 +703,8 @@ class DatabricksRestClient:
 
 
 # ---------------------------------------------------------------------------
-# Artifact Download / Upload (Databricks-native via mlflow)
+# Artifact Upload (target workspace — no env var mutation)
 # ---------------------------------------------------------------------------
-
-class SourceArtifactDownloader:
-    """Downloads artifacts from a SOURCE workspace using mlflow.
-
-    Uses mlflow.artifacts.download_artifacts() with explicit env var setup.
-    Thread-safe: all download workers target the SAME source workspace,
-    so env vars are set once at construction and never mutated.
-
-    This class is used in Phase 1 (download only) of the two-phase pipeline.
-    During Phase 1, no target writes happen, so there's no env var conflict.
-    """
-
-    def __init__(
-        self,
-        host: str,
-        token: str | None = None,
-        client_id: str | None = None,
-        client_secret: str | None = None,
-    ) -> None:
-        self.host = host.rstrip("/")
-        self._token = token
-        self._client_id = client_id
-        self._client_secret = client_secret
-
-    def _apply_env(self) -> dict[str, str | None]:
-        """Set env vars to point mlflow at the source workspace. Returns previous values."""
-        import mlflow
-        keys = [
-            "DATABRICKS_HOST", "DATABRICKS_TOKEN",
-            "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET",
-            "MLFLOW_TRACKING_URI", "MLFLOW_REGISTRY_URI",
-        ]
-        previous = {k: os.environ.get(k) for k in keys}
-        os.environ["DATABRICKS_HOST"] = self.host
-        if self._token:
-            os.environ["DATABRICKS_TOKEN"] = self._token
-            os.environ.pop("DATABRICKS_CLIENT_ID", None)
-            os.environ.pop("DATABRICKS_CLIENT_SECRET", None)
-        else:
-            os.environ.pop("DATABRICKS_TOKEN", None)
-            if self._client_id:
-                os.environ["DATABRICKS_CLIENT_ID"] = self._client_id
-            if self._client_secret:
-                os.environ["DATABRICKS_CLIENT_SECRET"] = self._client_secret
-        os.environ["MLFLOW_TRACKING_URI"] = "databricks"
-        os.environ["MLFLOW_REGISTRY_URI"] = "databricks"
-        mlflow.set_tracking_uri("databricks")
-        mlflow.set_registry_uri("databricks")
-        return previous
-
-    def _restore_env(self, previous: dict[str, str | None]) -> None:
-        """Restore env vars to previous values."""
-        import mlflow
-        for k, v in previous.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-        mlflow.set_tracking_uri(previous.get("MLFLOW_TRACKING_URI") or "databricks")
-        mlflow.set_registry_uri(previous.get("MLFLOW_REGISTRY_URI") or "databricks")
-
-    @_retry_on_rate_limit(max_retries=3)
-    def download_artifacts(
-        self,
-        run_id: str,
-        artifact_path: str | None,
-        dst_path: str,
-    ) -> str:
-        """Download artifacts from source workspace to local staging.
-
-        Thread-safe because ALL concurrent calls set the SAME env vars
-        (pointing to the same source workspace). No target writes happen
-        during the download phase.
-        """
-        import mlflow
-        previous = self._apply_env()
-        try:
-            return mlflow.artifacts.download_artifacts(
-                run_id=run_id,
-                artifact_path=artifact_path,
-                dst_path=dst_path,
-                tracking_uri="databricks",
-            )
-        finally:
-            self._restore_env(previous)
-
 
 class TargetArtifactUploader:
     """Uploads artifacts to the TARGET (current) workspace.

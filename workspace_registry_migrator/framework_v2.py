@@ -1,7 +1,7 @@
 """MLflow Model Migration Framework v2.
 
 Key improvements over v1:
- - REST-based metadata operations (no env var mutation, fully thread-safe)
+ - REST-based operations including presigned-URL artifact downloads (zero env var mutation)
  - Two-phase pipeline: download artifacts first, then register
  - Sequential per-model version registration (preserves version ordering)
  - MLflow version compatibility checking
@@ -26,7 +26,6 @@ from mlflow.entities import Metric, Param, RunTag
 
 from workspace_registry_migrator.rest_client import (
     DatabricksRestClient,
-    SourceArtifactDownloader,
     TargetArtifactUploader,
     CompatReport,
     check_compatibility,
@@ -196,13 +195,8 @@ class WorkspaceRegistryMigrator:
         self._target_client = MlflowClient()  # tracking (experiments, runs)
         self._target_model_client = MlflowClient(registry_uri=_registry_uri)  # model registry
 
-        # Artifact handlers
-        self.source_downloader = SourceArtifactDownloader(
-            host=source_credentials.normalized_host(),
-            token=source_credentials.token,
-            client_id=source_credentials.client_id,
-            client_secret=source_credentials.client_secret,
-        )
+        # Artifact handlers — source downloads go through source_rest
+        # (presigned URLs, no env var mutation); target uploads use MLflow SDK
         self.target_uploader = TargetArtifactUploader()
 
         # Target workspace info
@@ -596,8 +590,8 @@ class WorkspaceRegistryMigrator:
                     actual_run = source_run.get("run", source_run)
                     artifact_uri = actual_run.get("info", {}).get("artifact_uri", "")
                     artifact_subpath = self._source_model_artifact_path(v)
-                    # Download model artifacts
-                    self.source_downloader.download_artifacts(
+                    # Download model artifacts via presigned URLs
+                    self.source_rest.download_artifact_tree(
                         run_id=run_id,
                         artifact_path=artifact_subpath,
                         dst_path=artifact_dir,
@@ -605,9 +599,15 @@ class WorkspaceRegistryMigrator:
                     # Optionally download all run artifacts
                     if self.options.include_run_artifacts and self.options.download_artifacts:
                         try:
-                            self.source_downloader.download_artifacts(
-                                run_id=run_id, artifact_path="", dst_path=artifact_dir,
-                            )
+                            root_artifacts = self.source_rest.list_artifacts(run_id)
+                            for art in root_artifacts:
+                                if not art.path or art.path == artifact_subpath:
+                                    continue
+                                self.source_rest.download_artifact_tree(
+                                    run_id=run_id,
+                                    artifact_path=art.path,
+                                    dst_path=artifact_dir,
+                                )
                         except Exception:
                             pass
                 except Exception as exc:
@@ -1301,7 +1301,11 @@ class WorkspaceRegistryMigrator:
         staging_dir: str,
         experiment_name_map: dict[str, str],
     ) -> StagedVersion | None:
-        """Phase 1: Download artifacts for a single version to local staging."""
+        """Phase 1: Download artifacts for a single version to local staging.
+
+        Uses presigned URLs via ``source_rest.download_artifact_tree()`` —
+        fully thread-safe with zero env var mutation.
+        """
         run_id = version.get("run_id")
         if not run_id:
             return None
@@ -1314,9 +1318,9 @@ class WorkspaceRegistryMigrator:
         # Determine artifact subpath
         artifact_subpath = self._source_model_artifact_path(version)
 
-        # Download model artifacts to staging
+        # Download model artifacts to staging via presigned URLs
         try:
-            self.source_downloader.download_artifacts(
+            self.source_rest.download_artifact_tree(
                 run_id=run_id,
                 artifact_path=artifact_subpath,
                 dst_path=staging_dir,
@@ -1327,9 +1331,6 @@ class WorkspaceRegistryMigrator:
 
         # Optionally download all run artifacts
         if self.options.include_run_artifacts and self.options.download_artifacts:
-            # List root artifacts via REST and download each valid one individually.
-            # Avoids passing artifact_path=None to mlflow, which hits phantom empty-path
-            # entries in the artifact list and raises INVALID_PARAMETER_VALUE.
             try:
                 root_artifacts = self.source_rest.list_artifacts(run_id)
                 for art in root_artifacts:
@@ -1338,7 +1339,7 @@ class WorkspaceRegistryMigrator:
                     if art.path == artifact_subpath:
                         continue  # already downloaded as model artifact above
                     try:
-                        self.source_downloader.download_artifacts(
+                        self.source_rest.download_artifact_tree(
                             run_id=run_id,
                             artifact_path=art.path,
                             dst_path=staging_dir,
