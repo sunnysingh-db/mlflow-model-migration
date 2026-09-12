@@ -576,11 +576,16 @@ class WorkspaceRegistryMigrator:
             mname = model["name"]
             safe_name = sanitize_name(mname)
             versions = bundle.model_versions_by_name.get(mname, [])
+            _n_ver = len(versions)
+            print(f"    \U0001f4e6 {mname:<38}({_n_ver} version{'s' if _n_ver != 1 else ''})")
+            _export_ok = 0
             for v in versions:
                 run_id = v.get("run_id")
-                if not run_id:
-                    continue
                 ver_num = str(v.get("version", "0"))
+                if not run_id:
+                    print(f"        \u26a0\ufe0f  v{ver_num} (no run_id \u2014 metadata only)")
+                    _export_ok += 1
+                    continue
                 artifact_dir = os.path.join(
                     models_dir, safe_name, "versions", ver_num, "artifacts",
                 )
@@ -610,10 +615,17 @@ class WorkspaceRegistryMigrator:
                                 )
                         except Exception:
                             pass
+                    print(f"        \u2705 v{ver_num}")
+                    _export_ok += 1
                 except Exception as exc:
+                    print(f"        \u274c v{ver_num}: {str(exc)[:60]}")
                     self.logger.warning(
                         f"Export: Failed to download artifacts for {mname} v{ver_num}: {exc}"
                     )
+            if _export_ok == _n_ver:
+                print(f"    \u2705 {mname} exported successfully")
+            else:
+                print(f"    \u26a0\ufe0f  {mname} \u2014 {_export_ok}/{_n_ver} versions exported")
 
         self.logger.info(
             f"Export complete: {len(bundle.registered_models)} models, "
@@ -840,8 +852,11 @@ class WorkspaceRegistryMigrator:
 
             versions = bundle.model_versions_by_name.get(model_name, [])
             versions.sort(key=lambda v: int(v.get("version", 0)))
+            _n_ver = len(versions)
+            print(f"    \U0001f4e6 {model_name:<38}({_n_ver} version{'s' if _n_ver != 1 else ''})")
 
             model_created = False
+            _import_ok = 0
             for v in versions:
                 ver_num = str(v.get("version", "0"))
                 run_id = v.get("run_id")
@@ -849,6 +864,8 @@ class WorkspaceRegistryMigrator:
                 # Check for existing
                 if self.options.skip_existing_model_versions:
                     if self._target_model_version_exists(target_model_name, ver_num):
+                        print(f"        \u2705 v{ver_num} (already exists)")
+                        _import_ok += 1
                         continue
 
                 # Locate pre-downloaded artifacts
@@ -868,12 +885,15 @@ class WorkspaceRegistryMigrator:
                         self._register_placeholder_version(staged, target_model_name)
                         total_versions += 1
                         model_created = True
+                        print(f"        \u26a0\ufe0f  v{ver_num} (placeholder \u2014 no artifacts in bundle)")
+                        _import_ok += 1
                     else:
                         self._skipped_versions.append({
                             "model": model_name,
                             "version": ver_num,
                             "reason": "No artifacts in export bundle",
                         })
+                        print(f"        \u274c v{ver_num}: no artifacts in bundle")
                     continue
 
                 # Find or create the target run for this version
@@ -979,9 +999,15 @@ class WorkspaceRegistryMigrator:
                 total_versions += 1
                 total_runs += 1
                 model_created = True
+                print(f"        \u2705 v{ver_num}")
+                _import_ok += 1
 
             if model_created:
                 total_models += 1
+            if _import_ok == _n_ver:
+                print(f"    \u2705 {model_name} imported successfully")
+            else:
+                print(f"    \u26a0\ufe0f  {model_name} \u2014 {_import_ok}/{_n_ver} versions imported")
             if self.tracking_table:
                 self._update_tracking_table(
                     model_name=model_name,
@@ -1380,12 +1406,19 @@ class WorkspaceRegistryMigrator:
         migrated_runs = 0
 
         for sv in staged_versions:
+            src_ver = sv.version.get("version", "?")
             try:
                 result = self._register_staged_version(
                     sv, target_model_name, experiment_name_map,
                 )
                 migrated_versions += 1
                 migrated_runs += result.get("runs", 0)
+
+                # Live progress: version succeeded
+                if sv.is_placeholder:
+                    print(f"        \u26a0\ufe0f  v{src_ver} (placeholder \u2014 source run missing)")
+                else:
+                    print(f"        \u2705 v{src_ver}")
 
                 # Version ordering check
                 created_version = result.get("target_version")
@@ -1395,6 +1428,8 @@ class WorkspaceRegistryMigrator:
                         f"Version mismatch: {model_name} source v{source_version} -> target v{created_version}"
                     )
             except Exception as exc:
+                # Live progress: version failed
+                print(f"        \u274c v{src_ver}: {str(exc)[:60]}")
                 self.logger.warning(
                     f"Registration failed for {model_name} v{sv.version.get('version')}: {exc}"
                 )

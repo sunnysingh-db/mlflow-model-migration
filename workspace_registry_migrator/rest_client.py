@@ -617,6 +617,62 @@ class DatabricksRestClient:
                     files.append(entry.path)
         return files
 
+    def _download_artifact_direct(self, run_id: str, path: str, local_path: str) -> None:
+        """Download a single artifact via GET /api/2.0/mlflow/get-artifact.
+
+        This streams the file through the workspace REST API using the
+        session's auth headers.  No storage-proxy or presigned URL needed
+        — works on any cloud regardless of network policies.
+
+        Handles the redirect chain that older artifact storage formats use
+        (302 → /ajax-dbfs/…) by following redirects with auth headers.
+        Detects HTML login pages returned on auth failure and raises.
+        """
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+        # First request — disable auto-redirect so we can inject auth
+        resp = self._session.get(
+            f"{self.host}/api/2.0/mlflow/get-artifact",
+            params={"run_uuid": run_id, "path": path},
+            stream=True,
+            allow_redirects=False,
+            timeout=300,
+        )
+
+        # Follow redirects manually (max 3 hops) keeping auth headers
+        for _ in range(3):
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                break
+            location = resp.headers.get("location", "")
+            if not location:
+                break
+            if location.startswith("/"):
+                location = f"{self.host}{location}"
+            resp = self._session.get(
+                location, stream=True, allow_redirects=False, timeout=300,
+            )
+
+        resp.raise_for_status()
+
+        # Guard against HTML login pages masquerading as 200 OK
+        content_type = resp.headers.get("content-type", "")
+        peek = resp.content[:100] if not resp.headers.get("transfer-encoding") else b""
+        if b"<!doctype" in peek.lower() or b"<html" in peek.lower():
+            raise RuntimeError(
+                f"get-artifact returned HTML instead of artifact content "
+                f"(run={run_id}, path={path}). This run may use a legacy "
+                f"artifact storage format not accessible via REST API."
+            )
+
+        with open(local_path, "wb") as f:
+            # If we already consumed content for the peek, write it
+            if peek:
+                f.write(resp.content)
+            else:
+                for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
     def download_artifact_tree(
         self,
         run_id: str,
@@ -626,12 +682,17 @@ class DatabricksRestClient:
         batch_size: int = 8,
         max_workers: int = 10,
     ) -> str:
-        """Download an artifact tree via presigned URLs — fully thread-safe.
+        """Download an artifact tree — fully thread-safe, two-tier strategy.
 
-        1. Recursively lists all files under *artifact_path*.
-        2. Batches the paths and fetches presigned URLs.
-        3. Downloads each file with a plain ``requests.get()`` (no auth headers).
-        4. Writes to *dst_path* preserving the directory structure.
+        **Tier 1 — presigned / storage-proxy URLs** (fast, parallel):
+        Fetches URLs via ``credentials-for-read`` and downloads with plain
+        ``requests.get()`` (no auth headers).  Works on most workspaces.
+
+        **Tier 2 — direct REST fallback** (reliable, any cloud/network):
+        For any file where Tier 1 fails (network policy, proxy unreachable,
+        GCP org-policy restrictions), falls back to
+        ``GET /api/2.0/mlflow/get-artifact`` which streams the file through
+        the workspace REST API using the session's own auth headers.
 
         No environment variables are read or mutated — safe for concurrent
         use from any number of threads.
@@ -643,25 +704,26 @@ class DatabricksRestClient:
         # 1. Enumerate files
         all_files = self._list_artifact_files_recursive(run_id, artifact_path)
         if not all_files:
-            # artifact_path may itself be a single file
             all_files = [artifact_path]
 
         # 2. Fetch presigned URLs in batches
-        url_map: dict[str, str] = {}  # artifact_path -> signed_uri
-        for i in range(0, len(all_files), batch_size):
-            batch = all_files[i : i + batch_size]
-            cred_infos = self.get_artifact_presigned_urls(run_id, batch)
-            for info in cred_infos:
-                signed_uri = info.get("signed_uri", "")
-                info_path = info.get("path", "")
-                if signed_uri and info_path:
-                    url_map[info_path] = signed_uri
+        url_map: dict[str, str] = {}
+        try:
+            for i in range(0, len(all_files), batch_size):
+                batch = all_files[i : i + batch_size]
+                cred_infos = self.get_artifact_presigned_urls(run_id, batch)
+                for info in cred_infos:
+                    signed_uri = info.get("signed_uri", "")
+                    info_path = info.get("path", "")
+                    if signed_uri and info_path:
+                        url_map[info_path] = signed_uri
+        except Exception as exc:
+            logger.warning(f"credentials-for-read failed, using direct REST: {exc}")
 
-        # 3. Download files in parallel
-        errors: list[str] = []
+        # 3. Download: presigned first, direct REST fallback per-file
+        failed_presigned: list[str] = []  # paths that need direct REST
 
-        def _download_one(artifact_file_path: str, signed_uri: str) -> None:
-            # Compute local destination preserving directory structure
+        def _download_one_presigned(artifact_file_path: str, signed_uri: str) -> None:
             local_path = os.path.join(dst_path, artifact_file_path)
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             resp = requests.get(signed_uri, stream=True, timeout=300)
@@ -671,24 +733,53 @@ class DatabricksRestClient:
                     if chunk:
                         f.write(chunk)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(_download_one, path, uri): path
-                for path, uri in url_map.items()
-            }
-            for future in as_completed(futures):
-                path = futures[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    errors.append(f"{path}: {exc}")
-                    logger.warning(f"Presigned download failed for {path}: {exc}")
+        # Tier 1: presigned URL downloads
+        if url_map:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(_download_one_presigned, path, uri): path
+                    for path, uri in url_map.items()
+                }
+                for future in as_completed(futures):
+                    path = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        logger.warning(f"Presigned download failed for {path}: {exc}")
+                        failed_presigned.append(path)
 
-        if errors and len(errors) == len(url_map):
-            raise RuntimeError(
-                f"All {len(errors)} artifact downloads failed. "
-                f"First error: {errors[0]}"
-            )
+        # Collect all files that still need downloading
+        files_without_url = [f for f in all_files if f not in url_map]
+        need_direct = failed_presigned + files_without_url
+
+        # Tier 2: direct REST fallback
+        if need_direct:
+            tier = "fallback" if url_map else "primary (no presigned URLs available)"
+            logger.info(f"Direct REST download ({tier}) for {len(need_direct)} file(s)")
+            direct_errors: list[str] = []
+
+            def _download_one_direct(artifact_file_path: str) -> None:
+                local_path = os.path.join(dst_path, artifact_file_path)
+                self._download_artifact_direct(run_id, artifact_file_path, local_path)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(_download_one_direct, path): path
+                    for path in need_direct
+                }
+                for future in as_completed(futures):
+                    path = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        direct_errors.append(f"{path}: {exc}")
+                        logger.warning(f"Direct REST download failed for {path}: {exc}")
+
+            if direct_errors and len(direct_errors) == len(need_direct) and not url_map:
+                raise RuntimeError(
+                    f"All {len(direct_errors)} artifact downloads failed. "
+                    f"First error: {direct_errors[0]}"
+                )
 
         return os.path.join(dst_path, artifact_path)
 

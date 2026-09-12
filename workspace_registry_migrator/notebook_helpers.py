@@ -154,10 +154,6 @@ def _execute_export(migrator, log, source_host, target_host, direction, t0, arti
 
     bundle, manifest_path = migrator.export_bundle()
 
-    for m in bundle.registered_models:
-        n_ver = len(bundle.model_versions_by_name.get(m["name"], []))
-        _R.ok(m["name"], f"{n_ver} versions exported")
-
     total_v = sum(len(v) for v in bundle.model_versions_by_name.values())
     total_r = sum(len(r) for r in bundle.runs_by_experiment_id.values())
 
@@ -525,10 +521,14 @@ def execute_migration(
 
         skipped_before = len(getattr(migrator, "_skipped_versions", []))
         log_before = len(log.entries)
+
+        # Live progress: model start
+        print(f"    \U0001f4e6 {mname:<38}({len(versions)} version{'s' if len(versions) != 1 else ''})")
+
         try:
             counts = migrator._migrate_models(mini, experiment_name_map)
         except Exception as exc:
-            _R.fail(f"Model: {mname}", str(exc)[:60])
+            print(f"    \u274c {mname} failed: {str(exc)[:60]}")
             row["Status"] = "\u274c FAILED"
             row["Comments"] = str(exc)[:200]
             migration_rows.append(row)
@@ -542,12 +542,12 @@ def execute_migration(
         n_ok = len(versions) - len(new_skipped)
         row["Versions"] = n_ok
         if new_skipped:
-            _R.warn(f"Model: {mname}", f"{n_ok}/{len(versions)} versions migrated")
+            print(f"    \u26a0\ufe0f  {mname} \u2014 {n_ok}/{len(versions)} versions migrated")
             all_skipped.extend(new_skipped)
             row["Status"] = "\u26a0\ufe0f PARTIAL"
             row["Comments"] = f"{len(new_skipped)} version(s) skipped"
         else:
-            _R.ok(f"Model: {mname}", f"{len(versions)} versions migrated")
+            print(f"    \u2705 {mname} migrated successfully")
             row["Status"] = "\u2705 OK"
 
         if log_warnings:
