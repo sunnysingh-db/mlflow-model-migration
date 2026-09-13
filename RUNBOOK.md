@@ -247,7 +247,7 @@ Each scenario can run in three modes:
 | --- | --- | --- | --- |
 | `UC_TARGET_CATALOG` | `str` | If UC target | Override the target catalog name. Required for WS→UC. For UC→UC, if empty, mirrors the source catalog. |
 | `UC_TARGET_SCHEMA` | `str` | If UC target | Override the target schema name. Required for WS→UC. For UC→UC, if empty, mirrors the source schema. |
-| `MODEL_NAME_PREFIX` | `str` | No | Prefix added to model names on the target. Useful to avoid name collisions on same-workspace migrations. Example: `"migrated_"` turns `my_model` into `migrated_my_model`. Auto-generated for WS→WS if left blank. |
+| `MODEL_NAME_PREFIX` | `str` | No | Prefix added to model names on the target. Useful to avoid name collisions on same-workspace migrations. Example: `"migrated_"` turns `my_model` into `migrated_my_model`. Leave blank (`""`) or `None` for no prefix — models keep their original names on the target. |
 
 ### 7.5 Migration Mode
 
@@ -337,7 +337,7 @@ BATCH_SIZE       = 10
 ```
 
 **Key behaviors:**
-- If `MODEL_NAME_PREFIX` is left blank, an auto-generated prefix (`ws2ws_<timestamp>_`) is applied to prevent overwriting source models.
+- If `MODEL_NAME_PREFIX` is left blank (`""`) or `None`, **no prefix is added** — models are created on the target with their original names. Set an explicit prefix (e.g., `"migrated_"`) if you need to avoid name collisions on same-workspace migrations.
 - Experiments are recreated under `/Shared/mlflow-workspace-migration/` on the target.
 - Each target model version is tagged with `source_workspace_host`, `source_model_name`, and `source_model_version` for traceability.
 

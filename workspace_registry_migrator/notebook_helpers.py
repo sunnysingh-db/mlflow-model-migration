@@ -318,8 +318,11 @@ def execute_migration(
     target_host = w.config.host
     direction = _DIRECTIONS.get((source_registry, target_registry), f"{source_registry} > {target_registry}")
 
-    if target_registry == "workspace" and not model_name_prefix:
-        model_name_prefix = f"ws2ws_{int(time.time())}_"
+    # If prefix is explicitly None or not provided, treat as empty string (no prefix).
+    # Previously this auto-generated a "ws2ws_<timestamp>_" prefix for workspace targets,
+    # but that is undesirable — users who leave the prefix blank expect no prefix.
+    if model_name_prefix is None:
+        model_name_prefix = ""
 
     token = source_token if auth_mode == "pat" else None
     client_id = sp_client_id if auth_mode == "service_principal" else None
