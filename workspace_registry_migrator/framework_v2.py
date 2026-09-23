@@ -1404,6 +1404,9 @@ class WorkspaceRegistryMigrator:
 
         migrated_versions = 0
         migrated_runs = 0
+        # Maps source version number -> target version number, so aliases that
+        # point at a source version can be replayed onto the right target version.
+        version_map: dict[str, str] = {}
 
         for sv in staged_versions:
             src_ver = sv.version.get("version", "?")
@@ -1423,6 +1426,8 @@ class WorkspaceRegistryMigrator:
                 # Version ordering check
                 created_version = result.get("target_version")
                 source_version = sv.version.get("version")
+                if created_version:
+                    version_map[str(source_version)] = str(created_version)
                 if created_version and str(created_version) != str(source_version):
                     self.logger.warning(
                         f"Version mismatch: {model_name} source v{source_version} -> target v{created_version}"
@@ -1442,10 +1447,59 @@ class WorkspaceRegistryMigrator:
                 # Clean up staging dir for this version
                 shutil.rmtree(sv.local_artifact_dir, ignore_errors=True)
 
+        # Replay native UC aliases from the source (stage-derived aliases are
+        # handled per-version in _register_staged_version; this covers UC models
+        # whose versions carry aliases like `champion`/`prod` rather than stages).
+        self._migrate_uc_aliases(model_name, target_model_name, version_map)
+
         self.logger.info(
             f"Registered {model_name} -> {target_model_name}: {migrated_versions} versions"
         )
         return {"models": 1, "versions": migrated_versions, "runs": migrated_runs, "_model_name": model_name}
+
+    def _migrate_uc_aliases(
+        self,
+        source_model_name: str,
+        target_model_name: str,
+        version_map: dict[str, str],
+    ) -> None:
+        """Copy a UC source model's native aliases onto the target model.
+
+        Only applies to UC -> UC: aliases are a Unity Catalog concept, and a
+        Workspace-registry target uses stages instead. Source stages are already
+        translated to aliases per-version elsewhere, so this only reads aliases
+        that exist natively on the source registered model.
+        """
+        if self.options.source_registry != "uc" or self.options.target_registry != "uc":
+            return
+        try:
+            resp = self.source_rest.uc_get_registered_model(source_model_name)
+        except Exception as exc:
+            self.logger.warning(
+                f"Could not read source aliases for {source_model_name}: {exc}"
+            )
+            return
+        model = resp.get("registered_model", resp) or {}
+        aliases = model.get("aliases") or []
+        for entry in aliases:
+            alias = entry.get("alias") or entry.get("alias_name")
+            src_version = entry.get("version") or entry.get("version_num")
+            if not alias or src_version is None:
+                continue
+            # Map to the target version (identity when numbering is preserved).
+            tgt_version = version_map.get(str(src_version), str(src_version))
+            try:
+                self._target_model_client.set_registered_model_alias(
+                    name=target_model_name, alias=alias, version=str(tgt_version),
+                )
+                self.logger.info(
+                    f"Alias {alias} -> {target_model_name} v{tgt_version}"
+                )
+                print(f"        🔖 alias {alias} -> v{tgt_version}")
+            except Exception as exc:
+                self.logger.warning(
+                    f"Could not set alias {alias} on {target_model_name}: {exc}"
+                )
 
     def _register_staged_version(
         self,
