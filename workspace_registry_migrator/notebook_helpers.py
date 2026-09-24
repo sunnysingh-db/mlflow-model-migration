@@ -542,11 +542,20 @@ def execute_migration(
         new_logs = log.entries[log_before:]
         log_warnings = [msg for lvl, msg in new_logs if lvl in ("WARN", "ERROR")]
 
-        n_ok = len(versions) - len(new_skipped)
-        row["Versions"] = n_ok
+        # Use the count of versions that ACTUALLY registered on the target,
+        # not (discovered - skipped): a version can fail to register without
+        # being counted as skipped, and a run must never report success when
+        # zero versions migrated.
+        migrated_ct = counts.get("versions", 0)
+        row["Versions"] = migrated_ct
         if new_skipped:
-            print(f"    \u26a0\ufe0f  {mname} \u2014 {n_ok}/{len(versions)} versions migrated")
             all_skipped.extend(new_skipped)
+        if migrated_ct == 0 and new_skipped:
+            print(f"    \u274c {mname} \u2014 0/{len(versions)} versions migrated")
+            row["Status"] = "\u274c FAILED"
+            row["Comments"] = f"All {len(new_skipped)} version(s) failed to migrate"
+        elif new_skipped:
+            print(f"    \u26a0\ufe0f  {mname} \u2014 {migrated_ct}/{len(versions)} versions migrated")
             row["Status"] = "\u26a0\ufe0f PARTIAL"
             row["Comments"] = f"{len(new_skipped)} version(s) skipped"
         else:
