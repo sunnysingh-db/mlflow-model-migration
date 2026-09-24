@@ -202,6 +202,10 @@ class WorkspaceRegistryMigrator:
         # Target workspace info
         self._target_host = self._get_target_host()
 
+        # Lazily-created SDK client used to ensure workspace folders exist
+        # before creating experiments (see _ensure_workspace_dir).
+        self._ws_client = None
+
     @staticmethod
     def _get_target_host() -> str:
         from databricks.sdk import WorkspaceClient
@@ -1044,6 +1048,7 @@ class WorkspaceRegistryMigrator:
             if exp is None:
                 raise ValueError("not found")
         except Exception:
+            self._ensure_workspace_dir(self.options.shared_experiment_root)
             self._target_client.create_experiment(placeholder_exp)
             exp = self._target_client.get_experiment_by_name(placeholder_exp)
 
@@ -1455,7 +1460,14 @@ class WorkspaceRegistryMigrator:
         self.logger.info(
             f"Registered {model_name} -> {target_model_name}: {migrated_versions} versions"
         )
-        return {"models": 1, "versions": migrated_versions, "runs": migrated_runs, "_model_name": model_name}
+        # A model only counts as migrated if at least one version actually
+        # registered — otherwise the run must not report it as a success.
+        return {
+            "models": 1 if migrated_versions > 0 else 0,
+            "versions": migrated_versions,
+            "runs": migrated_runs,
+            "_model_name": model_name,
+        }
 
     def _migrate_uc_aliases(
         self,
@@ -1622,6 +1634,7 @@ class WorkspaceRegistryMigrator:
             if exp is None:
                 raise ValueError("not found")
         except Exception:
+            self._ensure_workspace_dir(self.options.shared_experiment_root)
             self._target_client.create_experiment(placeholder_exp)
             exp = self._target_client.get_experiment_by_name(placeholder_exp)
 
@@ -1797,9 +1810,32 @@ class WorkspaceRegistryMigrator:
 
     # ---- Target helpers (all via MLflow SDK — auto-authenticates to current workspace) ----
 
+    def _ensure_workspace_dir(self, path: str) -> None:
+        """Ensure a workspace directory (and its parents) exists.
+
+        MLflow ``create_experiment`` fails with
+        ``NOT_FOUND: Parent directory does not exist`` when the folder that will
+        hold the experiment (e.g. the shared migration root) has never been
+        created. ``workspace.mkdirs`` is idempotent, so this is safe to call
+        repeatedly.
+        """
+        if not path:
+            return
+        try:
+            if self._ws_client is None:
+                from databricks.sdk import WorkspaceClient
+                self._ws_client = WorkspaceClient()
+            self._ws_client.workspace.mkdirs(path)
+        except Exception as exc:
+            self.logger.warning(f"Could not ensure workspace dir {path}: {exc}")
+
     def _ensure_target_experiment(self, name: str, source_experiment: dict) -> None:
         existing = self._target_client.get_experiment_by_name(name)
         if existing is None:
+            # Ensure the parent workspace folder exists first, otherwise
+            # create_experiment fails with NOT_FOUND: Parent directory does not exist.
+            parent_dir = name.rsplit("/", 1)[0]
+            self._ensure_workspace_dir(parent_dir)
             tags = {
                 "source_workspace_host": self.source_credentials.normalized_host(),
                 "source_experiment_id": source_experiment.get("experiment_id", ""),
